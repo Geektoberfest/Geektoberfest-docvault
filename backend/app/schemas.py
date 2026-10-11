@@ -43,6 +43,14 @@ class DocumentResponse(DocumentBase):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+class DocumentPage(BaseModel):
+    items: list[DocumentResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
 # Folder Schemas
 class FolderBase(BaseModel):
     name: str

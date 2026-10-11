@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -60,9 +60,8 @@ def upload_document(
     db.refresh(new_doc)
     return new_doc
 
-# fixed : 
 @router.get("/", response_model=List[schemas.DocumentResponse])
-def get_documents(db: Session = Depends(get_db), 
+def get_documents(db: Session = Depends(get_db),
                   current_user: models.User = Depends(auth.get_current_user),
                   file_type: Optional[str] = None
                 ):
@@ -82,6 +81,35 @@ def search_documents(q: str, db: Session = Depends(get_db), current_user: models
         models.Document.owner_id == current_user.id,
         models.Document.original_filename.ilike(f"%{q}%")
     ).all()
+
+
+@router.get("/page", response_model=schemas.DocumentPage)
+def get_document_page(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    q: str = "",
+    folder_id: Optional[int] = Query(None, ge=1),
+    file_type: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    query = db.query(models.Document).filter(models.Document.owner_id == current_user.id)
+    if q:
+        query = query.filter(models.Document.original_filename.ilike(f"%{q}%"))
+    if folder_id is not None:
+        query = query.filter(models.Document.folder_id == folder_id)
+    if file_type and file_type.lower() != "all":
+        query = query.filter(models.Document.content_type.ilike(f"%{file_type}%"))
+
+    total = query.count()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    items = query.order_by(
+        models.Document.created_at.desc(), models.Document.id.desc()
+    ).offset((page - 1) * page_size).limit(page_size).all()
+    return schemas.DocumentPage(
+        items=items, total=total, page=page, page_size=page_size, total_pages=total_pages
+    )
 
 @router.get("/{doc_id}/download")
 def download_document(doc_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):

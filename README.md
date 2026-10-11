@@ -26,6 +26,7 @@ The frontend is deployed on Vercel, and the FastAPI backend is hosted on Render.
 - Create and delete folders
 - Rename folders with validation that preserves your input on errors
 - Search documents by filename
+- Browse documents in pages of 10, with search and folder filters
 
 ## Tech Stack
 
@@ -83,6 +84,25 @@ npm install
 npm run dev
 ```
 The React application will be available at `http://localhost:5173`.
+
+## Document pagination
+
+The document list shows 10 documents per page, newest first. Use **Previous** and
+**Next** below the table; the current page, matching document count, and page size
+are displayed alongside them. Search, folder, and file-type changes reset to page 1. Deleting
+the last item on a page returns you to the last available page. Empty results show
+helpful empty-state guidance and disable both navigation buttons.
+
+The frontend uses `GET /documents/page` with `page` (default 1), `page_size`
+(default 10, maximum 100), and optional `q`, `folder_id`, and `file_type`. The authenticated
+response contains `items`, `total`, `page`, `page_size`, and `total_pages`. Ownership,
+search, folder, and file-type filters are applied before counting and pagination. Results are
+ordered by creation time descending, then ID descending to break ties. Pages past
+the end are clamped to the last available page; zero results return page 1 of 1
+with an empty `items` array. Invalid page or page-size values return `422`.
+
+The existing `/documents/` and `/documents/search` endpoints keep their array
+responses for compatibility.
 
 ## Folder names
 

@@ -6,7 +6,8 @@ import App from "./App";
 import * as api from "./api";
 
 vi.mock("./api", () => ({
-  getMe: vi.fn(), getFolders: vi.fn(), getDocuments: vi.fn(),
+  API_URL: "http://localhost:8000",
+  getMe: vi.fn(), getFolders: vi.fn(), getDocumentPage: vi.fn(),
   createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
   uploadDocument: vi.fn(), deleteDocument: vi.fn(), searchDocuments: vi.fn(),
   login: vi.fn(), register: vi.fn(),
@@ -16,7 +17,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   localStorage.setItem("token", "test-token");
   api.getMe.mockResolvedValue({ data: { username: "alice" } });
-  api.getDocuments.mockResolvedValue({ data: [] });
+  api.getDocumentPage.mockResolvedValue({ data: { items: [], total: 0, page: 1, page_size: 10, total_pages: 1 } });
   api.getFolders.mockResolvedValue({ data: [{ id: 1, name: "Reports" }] });
 });
 

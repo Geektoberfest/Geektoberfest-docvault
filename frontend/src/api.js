@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://docvault-backend-iv5x.onrender.com';
+export const API_URL = import.meta.env.VITE_API_URL || 'https://docvault-backend-iv5x.onrender.com';
 
 const api = axios.create({
   baseURL: API_URL,
@@ -30,6 +30,7 @@ export const register = (username, email, password) => api.post('/auth/register'
 export const getMe = () => api.get('/auth/me');
 
 // Document endpoints
+export const getDocumentPage = (params, signal) => api.get('/documents/page', { params, signal });
 export const getDocuments = (q = '') => api.get(`/documents/?q=${q}`);
 export const uploadDocument = (formData) => api.post('/documents/upload', formData, {
   headers: {

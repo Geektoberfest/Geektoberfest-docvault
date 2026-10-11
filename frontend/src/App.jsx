@@ -1,13 +1,13 @@
 import { useState, useEffect } from "react";
 import {
-  getDocuments,
+  API_URL,
+  getDocumentPage,
   getFolders,
   uploadDocument,
   deleteDocument,
   createFolder,
   renameFolder,
   deleteFolder,
-  searchDocuments,
   login,
   register,
   getMe,
@@ -24,6 +24,8 @@ import {
   FiLogOut,
   FiUser,
 } from "react-icons/fi";
+
+const PAGE_SIZE = 10;
 
 function folderErrorMessage(err, fallback) {
   const detail = err.response?.data?.detail;
@@ -48,6 +50,12 @@ function App() {
   // App States
   const [selectedFileType, setSelectedFileType] = useState("all");
   const [documents, setDocuments] = useState([]);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [totalDocuments, setTotalDocuments] = useState(0);
+  const [completedRequestKey, setCompletedRequestKey] = useState(null);
+  const [documentsError, setDocumentsError] = useState("");
+  const [documentsVersion, setDocumentsVersion] = useState(0);
   const [folders, setFolders] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFolder, setSelectedFolder] = useState(null);
@@ -60,6 +68,8 @@ function App() {
   const [renamingFolder, setRenamingFolder] = useState(false);
   const [uploadFile, setUploadFile] = useState(null);
   const [error, setError] = useState("");
+  const requestKey = JSON.stringify([token, page, searchQuery, selectedFolder, selectedFileType, documentsVersion]);
+  const documentsLoading = completedRequestKey !== requestKey;
 
   useEffect(() => {
     if (token) {
@@ -75,7 +85,6 @@ function App() {
     try {
       const res = await getMe();
       setUser(res.data);
-      fetchDocuments();
       fetchFolders();
     } catch (err) {
       console.error(err);
@@ -83,25 +92,8 @@ function App() {
     }
   };
 
-  const fetchDocuments = async () => {
-    if (!token) return;
-    try {
-      if (searchQuery) {
-        return searchDocuments(searchQuery);
-      }
-      
-      const params = new URLSearchParams();
-      if (selectedFileType && selectedFileType !== "all") {
-        params.append("file_type", selectedFileType);
-      }
-      
-      const queryString = params.toString() ? `?${params.toString()}` : "";
-      const res = await api.get(`/documents/${queryString}`);
-      setDocuments(res.data);
-    } catch (err) {
-      console.error(err);
-      setError("Failed to fetch documents");
-    }
+  const refreshDocuments = () => {
+    setDocumentsVersion((version) => version + 1);
   };
 
   const fetchFolders = async () => {
@@ -116,8 +108,34 @@ function App() {
   };
 
   useEffect(() => {
-    if (token) fetchDocuments();
-  }, [searchQuery, selectedFileType]);
+    if (!token) return;
+    const controller = new AbortController();
+    let active = true;
+    getDocumentPage({
+      page,
+      page_size: PAGE_SIZE,
+      q: searchQuery,
+      folder_id: selectedFolder ?? undefined,
+      file_type: selectedFileType,
+    }, controller.signal).then(({ data }) => {
+      if (!active) return;
+      setDocumentsError("");
+      // Deletion may have removed the requested page; use the server's valid page.
+      setPage(data.page);
+      setDocuments(data.items);
+      setTotalPages(data.total_pages);
+      setTotalDocuments(data.total);
+    }).catch(() => {
+      if (active) setDocumentsError("Failed to fetch documents. Please try again.");
+    }).finally(() => {
+      if (active) setCompletedRequestKey(requestKey);
+    });
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [token, page, searchQuery, selectedFolder, selectedFileType, documentsVersion, requestKey]);
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -125,6 +143,7 @@ function App() {
     try {
       if (isLoginView) {
         const res = await login(authUsername, authPassword);
+        setPage(1);
         setToken(res.data.access_token);
       } else {
         await register(authUsername, authEmail, authPassword);
@@ -154,7 +173,7 @@ function App() {
     try {
       await uploadDocument(formData);
       setUploadFile(null);
-      fetchDocuments();
+      refreshDocuments();
     } catch (err) {
       console.error(err);
       setError(err.response?.data?.detail || "Upload failed");
@@ -164,7 +183,7 @@ function App() {
   const handleDeleteDoc = async (id) => {
     try {
       await deleteDocument(id);
-      fetchDocuments();
+      refreshDocuments();
     } catch (err) {
       console.error(err);
       setError("Failed to delete document");
@@ -215,18 +234,17 @@ function App() {
   const handleDeleteFolder = async (id) => {
     try {
       await deleteFolder(id);
-      if (selectedFolder === id) setSelectedFolder(null);
+      if (selectedFolder === id) {
+        setSelectedFolder(null);
+        setPage(1);
+      }
       fetchFolders();
-      fetchDocuments();
+      refreshDocuments();
     } catch (err) {
       console.error(err);
       setError("Failed to delete folder");
     }
   };
-
-  const filteredDocuments = selectedFolder
-    ? documents.filter((doc) => doc.folder_id === selectedFolder)
-    : documents;
 
   if (!token) {
     return (
@@ -324,7 +342,10 @@ function App() {
             placeholder="Search documents..."
             className="w-full pl-10 pr-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              setPage(1);
+            }}
           />
         </div>
         <div className="flex items-center gap-4">
@@ -352,7 +373,10 @@ function App() {
             <ul className="space-y-2">
               <li>
                 <button
-                  onClick={() => setSelectedFolder(null)}
+                  onClick={() => {
+                    setSelectedFolder(null);
+                    setPage(1);
+                  }}
                   className={`w-full text-left px-3 py-2 rounded-lg transition-colors ${selectedFolder === null ? "bg-indigo-50 text-indigo-700 font-medium" : "hover:bg-gray-100"}`}
                 >
                   All Documents
@@ -403,7 +427,7 @@ function App() {
                   ) : (
                     <div className="flex items-center group">
                       <button
-                        onClick={() => setSelectedFolder(folder.id)}
+                        onClick={() => { setSelectedFolder(folder.id); setPage(1); }}
                         className={`flex-1 min-w-0 text-left px-3 py-2 rounded-lg transition-colors truncate ${selectedFolder === folder.id ? "bg-indigo-50 text-indigo-700 font-medium" : "hover:bg-gray-100"}`}
                       >
                         {folder.name}
@@ -486,6 +510,7 @@ function App() {
             <form onSubmit={handleUpload} className="flex items-center gap-4">
               <input
                 type="file"
+                aria-label="Upload file"
                 className="text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"
                 onChange={(e) => setUploadFile(e.target.files[0])}
               />
@@ -510,7 +535,7 @@ function App() {
                 <select
                   id="fileTypeFilter"
                   value={selectedFileType}
-                  onChange={(e) => setSelectedFileType(e.target.value)}
+                  onChange={(e) => { setSelectedFileType(e.target.value); setPage(1); }}
                   className="px-2.5 py-1 text-xs border border-gray-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 >
                   <option value="all">All Types</option>
@@ -530,7 +555,22 @@ function App() {
                 </tr>
               </thead>
               <tbody>
-                {filteredDocuments.length === 0 ? (
+                {documentsLoading ? (
+                  <tr>
+                    <td colSpan="4" className="p-8 text-center text-gray-500" role="status">
+                      Loading documents...
+                    </td>
+                  </tr>
+                ) : documentsError ? (
+                  <tr>
+                    <td colSpan="4" className="p-8 text-center">
+                      <p role="alert" className="text-red-700">{documentsError}</p>
+                      <button onClick={refreshDocuments} className="mt-2 text-indigo-600 underline">
+                        Retry
+                      </button>
+                    </td>
+                  </tr>
+                ) : documents.length === 0 ? (
                   <tr>
                     <td colSpan="4" className="py-12 px-4 text-center">
                       <div className="flex flex-col items-center justify-center text-gray-500">
@@ -547,7 +587,7 @@ function App() {
                     </td>
                   </tr>
                 ) : (
-                  filteredDocuments.map((doc) => (
+                  documents.map((doc) => (
                     <tr
                       key={doc.id}
                       className="border-b last:border-0 hover:bg-gray-50 transition-colors"
@@ -592,6 +632,28 @@ function App() {
                 )}
               </tbody>
             </table>
+            <nav aria-label="Document pagination" className="flex flex-wrap items-center justify-between gap-3 border-t p-4 text-sm">
+              <span aria-live="polite">
+                {documentsLoading ? "Loading page..." : documentsError ? "Page unavailable" :
+                  `Page ${page} of ${totalPages} · ${totalDocuments} documents · ${PAGE_SIZE} per page`}
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setPage((current) => current - 1)}
+                  disabled={documentsLoading || Boolean(documentsError) || page <= 1}
+                  className="rounded border px-3 py-2 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Previous
+                </button>
+                <button
+                  onClick={() => setPage((current) => current + 1)}
+                  disabled={documentsLoading || Boolean(documentsError) || page >= totalPages}
+                  className="rounded border px-3 py-2 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Next
+                </button>
+              </div>
+            </nav>
           </div>
         </div>
       </main>
