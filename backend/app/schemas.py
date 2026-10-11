@@ -40,6 +40,17 @@ class DocumentResponse(DocumentBase):
     created_at: datetime
     file_path: str
     owner_id: int
+    current_version: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DocumentVersionResponse(BaseModel):
+    version_number: int
+    original_filename: str
+    file_size: int
+    content_type: str
+    created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -6,6 +6,7 @@ import App from "./App";
 import * as api from "./api";
 
 vi.mock("./api", () => ({
+  API_URL: "http://localhost:8000",
   getMe: vi.fn(), getFolders: vi.fn(), getDocuments: vi.fn(),
   createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
   uploadDocument: vi.fn(), deleteDocument: vi.fn(), searchDocuments: vi.fn(),

@@ -1,17 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 from typing import List, Optional
 import os
-import uuid
-import shutil
 from .. import models, schemas, auth
 from ..database import get_db
+from ..document_files import save_upload, remove_files, document_file_paths
 
 router = APIRouter()
-UPLOAD_DIR = "uploads"
-
-MAX_FILE_SIZE = 10 * 1024 * 1024 # 10 MB
 
 @router.post("/upload", response_model=schemas.DocumentResponse)
 def upload_document(
@@ -20,49 +17,88 @@ def upload_document(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    # Read file size
-    file.file.seek(0, 2)
-    file_size = file.file.tell()
-    file.file.seek(0)
-
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large. Max size is 10MB.")
-
     # Check folder if provided
     if folder_id:
         folder = db.query(models.Folder).filter(
             models.Folder.id == folder_id,
             models.Folder.owner_id == current_user.id
-        ).first()
+        ).with_for_update().first()
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found or you don't have access")
 
-    # Generate unique filename to avoid conflicts
-    file_ext = os.path.splitext(file.filename)[1]
-    unique_filename = f"{uuid.uuid4()}{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    new_doc = models.Document(
-        filename=unique_filename,
-        original_filename=file.filename,
-        file_path=file_path,
-        file_size=file_size,
-        content_type=file.content_type,
-        folder_id=folder_id,
-        owner_id=current_user.id
-    )
-
-    db.add(new_doc)
-    db.commit()
+    metadata = save_upload(file)
+    new_doc = models.Document(**metadata, folder_id=folder_id, owner_id=current_user.id, current_version=1)
+    new_doc.versions.append(models.DocumentVersion(**metadata, version_number=1))
+    try:
+        db.add(new_doc)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        remove_files([metadata["file_path"]])
+        raise HTTPException(status_code=500, detail="Could not save document") from exc
     db.refresh(new_doc)
     return new_doc
 
-# fixed : 
+
+@router.post("/{doc_id}/versions", response_model=schemas.DocumentResponse)
+def upload_version(
+    doc_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    # Serialize replacements of the same document so version numbers stay unique.
+    doc = db.query(models.Document).filter(
+        models.Document.id == doc_id,
+        models.Document.owner_id == current_user.id
+    ).with_for_update().first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    metadata = save_upload(file)
+    try:
+        version_number = doc.current_version + 1
+        db.add(models.DocumentVersion(document_id=doc.id, version_number=version_number, **metadata))
+        for field, value in metadata.items():
+            setattr(doc, field, value)
+        doc.current_version = version_number
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        remove_files([metadata["file_path"]])
+        raise HTTPException(status_code=500, detail="Could not save new version; current version is unchanged") from exc
+    db.refresh(doc)
+    return doc
+
+
+@router.get("/{doc_id}/versions", response_model=List[schemas.DocumentVersionResponse])
+def get_versions(doc_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    doc = db.query(models.Document).filter(
+        models.Document.id == doc_id, models.Document.owner_id == current_user.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return db.query(models.DocumentVersion).filter(
+        models.DocumentVersion.document_id == doc_id
+    ).order_by(models.DocumentVersion.version_number.desc()).all()
+
+
+@router.get("/{doc_id}/versions/{version_number}/download")
+def download_version(doc_id: int, version_number: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    version = db.query(models.DocumentVersion).join(models.Document).filter(
+        models.Document.id == doc_id,
+        models.Document.owner_id == current_user.id,
+        models.DocumentVersion.version_number == version_number
+    ).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Document version not found")
+    if not os.path.isfile(version.file_path):
+        raise HTTPException(status_code=404, detail="File not found on server")
+    return FileResponse(version.file_path, filename=version.original_filename, media_type=version.content_type)
+
+
 @router.get("/", response_model=List[schemas.DocumentResponse])
-def get_documents(db: Session = Depends(get_db), 
+def get_documents(db: Session = Depends(get_db),
                   current_user: models.User = Depends(auth.get_current_user),
                   file_type: Optional[str] = None
                 ):
@@ -106,14 +142,12 @@ def delete_document(doc_id: int, db: Session = Depends(get_db), current_user: mo
     doc = db.query(models.Document).filter(
         models.Document.id == doc_id,
         models.Document.owner_id == current_user.id
-    ).first()
+    ).with_for_update().first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
-    # Remove file from disk
-    if os.path.exists(doc.file_path):
-        os.remove(doc.file_path)
-
+    paths = document_file_paths(doc)
     db.delete(doc)
     db.commit()
+    remove_files(paths)
     return None

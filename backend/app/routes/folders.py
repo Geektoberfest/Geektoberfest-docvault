@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from typing import List
 from .. import models, schemas, auth
 from ..database import get_db
+from ..document_files import document_file_paths, remove_files
 
 router = APIRouter()
 
@@ -53,10 +54,17 @@ def delete_folder(folder_id: int, db: Session = Depends(get_db), current_user: m
     folder = db.query(models.Folder).filter(
         models.Folder.id == folder_id,
         models.Folder.owner_id == current_user.id
-    ).first()
+    ).with_for_update().first()
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")
     
+    documents = db.query(models.Document).filter(
+        models.Document.folder_id == folder_id
+    ).order_by(models.Document.id).with_for_update().all()
+    paths = set()
+    for document in documents:
+        paths.update(document_file_paths(document))
     db.delete(folder)
     db.commit()
+    remove_files(paths)
     return None
