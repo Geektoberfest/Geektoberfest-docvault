@@ -4,6 +4,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import * as api from "./api";
+import { saveFilterPresets } from "./filterPresets";
 
 vi.mock("./api", () => ({
   default: { get: vi.fn(), defaults: { baseURL: "https://api.test" } },
@@ -16,7 +17,7 @@ vi.mock("./api", () => ({
 beforeEach(() => {
   vi.resetAllMocks();
   localStorage.setItem("token", "test-token");
-  api.getMe.mockResolvedValue({ data: { username: "alice" } });
+  api.getMe.mockResolvedValue({ data: { id: 1, username: "alice" } });
   api.default.get.mockResolvedValue({ data: [] });
   api.searchDocuments.mockResolvedValue({ data: [] });
   api.getFolders.mockResolvedValue({ data: [{ id: 1, name: "Reports" }] });
@@ -237,5 +238,150 @@ describe("document search clear", () => {
     });
     expect(screen.queryByText("stale-search.pdf")).toBeNull();
     expect(screen.getByText("current-list.pdf")).toBeTruthy();
+  });
+});
+
+describe("saved filter presets", () => {
+  it("saves the current folder, type, and sort and restores it after reload", async () => {
+    const user = await openApp();
+    await user.click(screen.getByRole("button", { name: "Reports", exact: true }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Type:" }), "pdf");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Sort:" }), "name_asc");
+
+    const name = screen.getByRole("textbox", { name: "Save current filters" });
+    await user.type(name, "Quarterly reports");
+    await user.keyboard("{Enter}");
+    expect((await screen.findByRole("status")).textContent).toContain("Saved preset");
+
+    const stored = JSON.parse(localStorage.getItem("docvault:filter-presets:v1:1"));
+    expect(stored).toEqual({
+      version: 1,
+      presets: [{ name: "Quarterly reports", folderId: 1, fileType: "pdf", sortBy: "name_asc" }],
+    });
+
+    cleanup();
+    const reloadedUser = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("button", { name: "Rename Reports" });
+    await screen.findByRole("option", { name: "Quarterly reports" });
+    const select = screen.getByRole("combobox", { name: "Saved presets" });
+    expect(select.querySelectorAll("option")).toHaveLength(2);
+    await reloadedUser.selectOptions(select, "Quarterly reports");
+    await reloadedUser.click(screen.getByRole("button", { name: "Apply preset" }));
+
+    expect(screen.getByRole("combobox", { name: "Type:" }).value).toBe("pdf");
+    expect(screen.getByRole("combobox", { name: "Sort:" }).value).toBe("name_asc");
+    expect(screen.getByRole("button", { name: "Reports", exact: true }).className).toContain("bg-indigo-50");
+    await waitFor(() => expect(api.default.get).toHaveBeenLastCalledWith("/documents/?file_type=pdf&sort_by=name_asc"));
+
+    await reloadedUser.click(screen.getByRole("button", { name: "Delete preset" }));
+    expect(await screen.findByText(/No saved presets yet/)).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem("docvault:filter-presets:v1:1")).presets).toEqual([]);
+  });
+
+  it("clears search visibly before applying saved filters", async () => {
+    const storage = {
+      folderId: null,
+      fileType: "pdf",
+      sortBy: "date_desc",
+    };
+    saveFilterPresets(1, [{ name: "PDFs", ...storage }]);
+    api.searchDocuments.mockResolvedValue({ data: [makeDocument(70, "secret-hit.pdf", null, "application/pdf")] });
+
+    const user = await openApp();
+    const search = screen.getByRole("textbox", { name: "Search documents" });
+    await user.type(search, "secret");
+    expect(await screen.findByText("secret-hit.pdf")).toBeTruthy();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Saved presets" }), "PDFs");
+    await user.click(screen.getByRole("button", { name: "Apply preset" }));
+
+    await waitFor(() => expect(search.value).toBe(""));
+    expect((await screen.findByRole("status")).textContent).toContain("Search was cleared");
+    await waitFor(() => expect(api.default.get).toHaveBeenLastCalledWith("/documents/?file_type=pdf"));
+    expect(api.searchDocuments).toHaveBeenCalledWith("secret");
+  });
+
+  it("refuses presets whose folder is deleted or belongs to another user", async () => {
+    saveFilterPresets(1, [{ name: "Unavailable folder", folderId: 99, fileType: "pdf", sortBy: "name_desc" }]);
+    const user = await openApp();
+    const preset = await screen.findByRole("option", { name: "Unavailable folder" });
+    await user.selectOptions(screen.getByRole("combobox", { name: "Saved presets" }), preset.value);
+    await user.click(screen.getByRole("button", { name: "Apply preset" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("folder is no longer available");
+    expect(screen.getByRole("combobox", { name: "Type:" }).value).toBe("all");
+    expect(screen.getByRole("combobox", { name: "Sort:" }).value).toBe("date_desc");
+    expect(screen.getByRole("button", { name: "All Documents" }).className).toContain("bg-indigo-50");
+  });
+
+  it("shows the empty state and supports saving and applying by keyboard", async () => {
+    const user = await openApp();
+    expect(await screen.findByText(/No saved presets yet/)).toBeTruthy();
+    const name = screen.getByRole("textbox", { name: "Save current filters" });
+    await user.type(name, "Keyboard preset");
+    await user.keyboard("{Enter}");
+
+    expect((await screen.findByRole("status")).textContent).toContain("Saved preset");
+    expect(screen.getByRole("combobox", { name: "Saved presets" })).toBeTruthy();
+    const apply = screen.getByRole("button", { name: "Apply preset" });
+    apply.focus();
+    await user.keyboard("{Enter}");
+    expect((await screen.findByRole("status")).textContent).toContain("Applied preset");
+  });
+
+  it("keeps browsing available when preset storage is blocked", async () => {
+    const originalGetItem = Storage.prototype.getItem;
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (key) {
+      if (key.startsWith("docvault:filter-presets:")) throw new DOMException("blocked", "SecurityError");
+      return originalGetItem.call(this, key);
+    });
+
+    await openApp();
+    expect((await screen.findByRole("alert")).textContent).toContain("Saved presets are unavailable");
+    expect(screen.getByRole("textbox", { name: "Search documents" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Type:" }).disabled).toBe(false);
+  });
+
+  it("does not let an old document response repopulate state after logout", async () => {
+    let resolveSearch;
+    api.searchDocuments.mockImplementation(() => new Promise((resolve) => { resolveSearch = resolve; }));
+    const user = await openApp();
+    const search = screen.getByRole("textbox", { name: "Search documents" });
+    await user.type(search, "stale");
+    await waitFor(() => expect(api.searchDocuments).toHaveBeenCalledWith("stale"));
+    await user.click(screen.getByRole("button", { name: /Logout/ }));
+    expect(await screen.findByRole("heading", { name: "Sign in to your account" })).toBeTruthy();
+
+    await act(async () => resolveSearch({ data: [makeDocument(80, "old-account.pdf", 1, "application/pdf")] }));
+    expect(screen.queryByText("old-account.pdf")).toBeNull();
+    expect(screen.queryByText("Quarterly reports")).toBeNull();
+  });
+
+  it("loads a separate preset list after switching accounts", async () => {
+    saveFilterPresets(1, [{ name: "Alice only", folderId: null, fileType: "pdf", sortBy: "date_desc" }]);
+    api.getMe
+      .mockResolvedValueOnce({ data: { id: 1, username: "alice" } })
+      .mockResolvedValueOnce({ data: { id: 2, username: "bob" } });
+    api.login.mockResolvedValue({ data: { access_token: "second-token" } });
+
+    const user = await openApp();
+    await user.click(screen.getByRole("button", { name: /Logout/ }));
+    await user.type(document.querySelector('input[type="text"]'), "bob");
+    await user.type(document.querySelector('input[type="password"]'), "password");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await screen.findByRole("button", { name: "Rename Reports" });
+    expect(await screen.findByText("bob")).toBeTruthy();
+    expect(screen.getByText(/No saved presets yet/)).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "Alice only" })).toBeNull();
+    expect(api.login).toHaveBeenCalledWith("bob", "password");
+  });
+
+  it("keeps existing file-type and sorting requests intact", async () => {
+    const user = await openApp();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Type:" }), "image");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Sort:" }), "date_asc");
+
+    await waitFor(() => expect(api.default.get).toHaveBeenLastCalledWith("/documents/?file_type=image&sort_by=date_asc"));
   });
 });
