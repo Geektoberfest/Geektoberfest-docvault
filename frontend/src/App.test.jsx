@@ -375,6 +375,9 @@ describe("saved filter presets", () => {
     expect(screen.getByText(/No saved presets yet/)).toBeTruthy();
     expect(screen.queryByRole("option", { name: "Alice only" })).toBeNull();
     expect(api.login).toHaveBeenCalledWith("bob", "password");
+
+    await user.click(screen.getByRole("button", { name: /Logout/ }));
+    expect(document.querySelector('input[type="password"]').value).toBe("");
   });
 
   it("keeps existing file-type and sorting requests intact", async () => {

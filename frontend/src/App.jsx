@@ -101,6 +101,7 @@ function App() {
     const generation = ++accountGeneration.current;
     latestDocumentRequest.current += 1;
     setUser(null);
+    setAuthPassword("");
     setDocuments([]);
     setFolders([]);
     setFoldersLoaded(false);
@@ -148,6 +149,17 @@ function App() {
       const res = await getMe();
       if (generation !== accountGeneration.current) return;
       setUser(res.data);
+      const stored = loadFilterPresets(res.data.id);
+      setSavedFilterPresets(stored.presets);
+      setPresetsLoaded(true);
+      setPresetStorageAvailable(stored.storageAvailable);
+      setPresetError(
+        stored.error === "storage-unavailable"
+          ? "Saved presets are unavailable in this browser."
+          : stored.error === "invalid-data"
+            ? "Some saved presets were invalid and have been ignored."
+            : "",
+      );
       fetchFolders(generation);
     } catch (err) {
       if (generation !== accountGeneration.current) return;
@@ -221,23 +233,9 @@ function App() {
   };
 
   useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- fetchDocuments updates state after its network request resolves.
     if (token && user?.id) fetchDocuments();
   }, [token, user?.id, searchQuery, selectedFileType, sortBy]);
-
-  useEffect(() => {
-    if (!user?.id) return;
-    const stored = loadFilterPresets(user.id);
-    setSavedFilterPresets(stored.presets);
-    setPresetsLoaded(true);
-    setPresetStorageAvailable(stored.storageAvailable);
-    setPresetError(
-      stored.error === "storage-unavailable"
-        ? "Saved presets are unavailable in this browser."
-        : stored.error === "invalid-data"
-          ? "Some saved presets were invalid and have been ignored."
-          : "",
-    );
-  }, [user?.id]);
 
   const handleAuth = async (e) => {
     e.preventDefault();
