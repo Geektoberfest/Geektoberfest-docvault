@@ -51,6 +51,7 @@ function App() {
 
   // App States
   const [selectedFileType, setSelectedFileType] = useState("all");
+  const [sortBy, setSortBy] = useState("date_desc");
   const [documents, setDocuments] = useState([]);
   const [folders, setFolders] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -65,8 +66,15 @@ function App() {
   const [renameFolderError, setRenameFolderError] = useState("");
   const [renamingFolder, setRenamingFolder] = useState(false);
   const [uploadFile, setUploadFile] = useState(null);
+  const uploadInputRef = useRef(null);
+  const [uploadStatus, setUploadStatus] = useState("idle");
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const uploadController = useRef(null);
+  const uploadRequestId = useRef(0);
   const [error, setError] = useState("");
-  const [uploadSuccess, setUploadSuccess] = useState("");
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [showAudit, setShowAudit] = useState(false);
+  const [auditLoading, setAuditLoading] = useState(false);
 
   useEffect(() => {
     if (token) {
@@ -75,8 +83,23 @@ function App() {
     } else {
       localStorage.removeItem("token");
       setUser(null);
+      setUploadFile(null);
+      setUploadStatus("idle");
+      setUploadProgress(null);
     }
+    return () => {
+      if (!uploadController.current) return;
+      uploadRequestId.current += 1;
+      uploadController.current.abort();
+      uploadController.current = null;
+    };
   }, [token]);
+
+  useEffect(() => {
+    if (uploadStatus === "completed" || uploadStatus === "cancelled") {
+      uploadInputRef.current?.focus();
+    }
+  }, [uploadStatus]);
 
   const fetchMe = async () => {
     try {
@@ -162,44 +185,102 @@ function App() {
   };
 
   const handleLogout = () => {
+    uploadRequestId.current += 1;
+    uploadController.current?.abort();
+    uploadController.current = null;
+    setUploadFile(null);
+    setUploadStatus("idle");
+    setUploadProgress(null);
     setToken(null);
   };
 
-  const handleUpload = async (e) => {
-  e.preventDefault();
-  setError("");
-  setUploadSuccess("");
+  const handleUpload = async (event) => {
+    event.preventDefault();
+    setError("");
 
-  if (!uploadFile) {
-    setError("Please choose a file to upload first.");
-    return;
-  }
+    if (uploadController.current) return;
+    if (!uploadFile) {
+      setUploadStatus("failed");
+      setError("Please choose a file to upload first.");
+      return;
+    }
 
-  const maxBytes = 10 * 1024 * 1024;
-  if (uploadFile.size > maxBytes) {
-    setError("File is too large. Maximum allowed size is 10MB.");
-    return;
-  }
+    const maxBytes = 10 * 1024 * 1024;
+    if (uploadFile.size > maxBytes) {
+      setUploadStatus("failed");
+      setError("File is too large. Maximum allowed size is 10MB.");
+      return;
+    }
 
-  const formData = new FormData();
-  formData.append("file", uploadFile);
-  if (selectedFolder) {
-    formData.append("folder_id", selectedFolder);
-  }
+    const form = event.currentTarget;
+    const formData = new FormData();
+    formData.append("file", uploadFile);
+    if (selectedFolder) formData.append("folder_id", selectedFolder);
 
-  try {
-    await uploadDocument(formData);
-    setUploadFile(null);
-    e.target.reset(); // clear input
-    setUploadSuccess("Document uploaded successfully!");
-    setTimeout(() => setUploadSuccess(""), 4000);
-    fetchDocuments();
-  } catch (err) {
-    console.error(err);
-    const message = err.response?.data?.detail || "Upload failed. Please check the file format and try again.";
-    setError(message);
-  }
-};
+    const controller = new AbortController();
+    const requestId = ++uploadRequestId.current;
+    const isCurrentUpload = () =>
+      uploadRequestId.current === requestId && uploadController.current === controller;
+    uploadController.current = controller;
+    setUploadStatus("uploading");
+    setUploadProgress({ loaded: 0, total: null, percent: null });
+
+    try {
+      await uploadDocument(formData, {
+        signal: controller.signal,
+        onUploadProgress: ({ loaded, total, progress }) => {
+          if (!isCurrentUpload() || controller.signal.aborted) return;
+          const transferred = Number.isFinite(loaded) ? Math.max(0, loaded) : 0;
+          const expected = Number.isFinite(total) && total > 0 ? total : null;
+          const percent = expected === null
+            ? null
+            : Math.min(100, Math.floor((transferred / expected) * 100));
+          setUploadProgress({ loaded: transferred, total: expected, percent });
+          setUploadStatus(
+            (expected !== null && transferred >= expected) || progress >= 1
+              ? "processing"
+              : "uploading",
+          );
+        },
+      });
+
+      if (!isCurrentUpload()) return;
+      if (controller.signal.aborted) {
+        setUploadStatus("cancelled");
+        return;
+      }
+      setUploadStatus("completed");
+      setUploadFile(null);
+      setUploadProgress(null);
+      form.reset();
+      if (uploadInputRef.current) uploadInputRef.current.value = "";
+      fetchDocuments();
+    } catch (err) {
+      if (!isCurrentUpload()) return;
+      if (
+        controller.signal.aborted ||
+        err.code === "ERR_CANCELED" ||
+        err.name === "CanceledError" ||
+        err.name === "AbortError"
+      ) {
+        setUploadStatus("cancelled");
+      } else {
+        setUploadStatus("failed");
+        setError(folderErrorMessage(
+          err,
+          "Upload failed. Please check the file format and try again.",
+        ));
+      }
+    } finally {
+      if (uploadController.current === controller) uploadController.current = null;
+    }
+  };
+
+  const handleCancelUpload = () => {
+    if (!uploadController.current || uploadController.current.signal.aborted) return;
+    setUploadStatus("cancelling");
+    uploadController.current.abort();
+  };
 
   const handleDeleteDoc = async (id) => {
     if (!window.confirm("Are you sure you want to delete this document?")) {
@@ -270,6 +351,15 @@ function App() {
   const filteredDocuments = selectedFolder
     ? documents.filter((doc) => doc.folder_id === selectedFolder)
     : documents;
+  const uploadBusy = ["uploading", "processing", "cancelling"].includes(uploadStatus);
+  const uploadMessages = {
+    uploading: "Uploading file…",
+    processing: "Bytes transferred. Waiting for server confirmation…",
+    cancelling: "Cancelling upload…",
+    cancelled: "Upload cancelled. You can retry this file.",
+    completed: "Document uploaded successfully.",
+    failed: "Upload failed. You can retry this file or select another.",
+  };
 
   if (!token) {
     return (
@@ -538,18 +628,9 @@ function App() {
         {/* Main Content */}
         <div className="flex-1 overflow-hidden">
           {error && (
-            <div className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
+            <div role="alert" className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
               <p>{error}</p>
-              <button onClick={() => setError("")} className="font-bold">
-                &times;
-              </button>
-            </div>
-          )}
-
-          {uploadSuccess && (
-            <div className="bg-green-50 border-l-4 border-green-500 text-green-700 p-4 mb-6 rounded shadow-sm flex justify-between">
-              <p>{uploadSuccess}</p>
-              <button onClick={() => setUploadSuccess("")} className="font-bold">
+              <button aria-label="Dismiss error" onClick={() => setError("")} className="font-bold">
                 &times;
               </button>
             </div>
@@ -561,19 +642,67 @@ function App() {
               <p className="text-sm text-gray-500">Max size: 10MB</p>
             </div>
             <form onSubmit={handleUpload} className="flex items-center gap-4">
+              <label htmlFor="uploadDocumentFile" className="sr-only">Document file</label>
               <input
+                id="uploadDocumentFile"
+                ref={uploadInputRef}
                 type="file"
+                disabled={uploadBusy}
                 className="text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"
-                onChange={(e) => setUploadFile(e.target.files[0])}
+                onChange={(e) => {
+                  setUploadFile(e.target.files[0] || null);
+                  setUploadStatus("idle");
+                  setUploadProgress(null);
+                  setError("");
+                }}
               />
               <button
                 type="submit"
-                disabled={!uploadFile}
+                disabled={!uploadFile || uploadBusy}
                 className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 <FiUpload /> Upload
               </button>
+              {uploadBusy && (
+                <button
+                  type="button"
+                  onClick={handleCancelUpload}
+                  disabled={uploadStatus === "cancelling"}
+                  className="rounded border border-gray-300 px-3 py-2 text-sm hover:bg-gray-50 disabled:opacity-50"
+                >
+                  Cancel upload
+                </button>
+              )}
             </form>
+            {uploadStatus !== "idle" && (
+              <div className="mt-4 w-full" aria-atomic="true">
+                <p role="status" aria-live="polite" className="text-sm text-gray-700">
+                  {uploadMessages[uploadStatus]}
+                </p>
+                {(uploadStatus === "uploading" || uploadStatus === "processing") && uploadProgress && (
+                  <div className="mt-2">
+                    {uploadStatus === "processing" ? (
+                      <progress aria-label="Server processing" className="w-full" />
+                    ) : uploadProgress.total === null ? (
+                      <progress aria-label="Upload progress" className="w-full" />
+                    ) : (
+                      <progress
+                        aria-label="Upload progress"
+                        aria-valuetext={`${uploadProgress.percent}% transferred`}
+                        max="100"
+                        value={uploadProgress.percent}
+                        className="w-full"
+                      />
+                    )}
+                    <p className="text-xs text-gray-600">
+                      {uploadProgress.total === null
+                        ? `${formatFileSize(uploadProgress.loaded)} transferred`
+                        : `${uploadProgress.percent}% transferred (${formatFileSize(uploadProgress.loaded)} of ${formatFileSize(uploadProgress.total)})`}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="bg-white rounded-xl shadow-sm border overflow-hidden">

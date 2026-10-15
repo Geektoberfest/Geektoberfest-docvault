@@ -239,3 +239,150 @@ describe("document search clear", () => {
     expect(screen.getByText("current-list.pdf")).toBeTruthy();
   });
 });
+
+describe("document upload progress and cancellation", () => {
+  it("reports transferred bytes and waits for server confirmation before success", async () => {
+    let options;
+    let resolveUpload;
+    api.uploadDocument.mockImplementation((_formData, requestOptions) => {
+      options = requestOptions;
+      return new Promise((resolve) => { resolveUpload = resolve; });
+    });
+    const user = await openApp();
+    const input = screen.getByLabelText("Document file");
+    await user.upload(input, new File(["test"], "report.pdf", { type: "application/pdf" }));
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+
+    await waitFor(() => expect(api.uploadDocument).toHaveBeenCalledTimes(1));
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+    await act(async () => options.onUploadProgress({ loaded: 40, total: 100, progress: 0.4 }));
+    expect(Number(screen.getByRole("progressbar", { name: "Upload progress" }).value)).toBe(40);
+    expect(screen.getByRole("status").textContent).toContain("Uploading file");
+
+    await act(async () => options.onUploadProgress({ loaded: 100, total: 100, progress: 1 }));
+    expect(screen.getByRole("status").textContent).toContain("Waiting for server confirmation");
+    expect(screen.queryByText("Document uploaded successfully.")).toBeNull();
+
+    await act(async () => resolveUpload({ data: { id: 1 } }));
+    expect(screen.getByRole("status").textContent).toBe("Document uploaded successfully.");
+    expect(input.files).toHaveLength(0);
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("shows byte counts when Axios cannot provide a total length", async () => {
+    let options;
+    api.uploadDocument.mockImplementation((_formData, requestOptions) => {
+      options = requestOptions;
+      return new Promise((_resolve, reject) => {
+        requestOptions.signal.addEventListener("abort", () => reject(Object.assign(new Error("canceled"), { name: "CanceledError" })), { once: true });
+      });
+    });
+    const user = await openApp();
+    await user.upload(screen.getByLabelText("Document file"), new File(["test"], "report.pdf"));
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+
+    await act(async () => options.onUploadProgress({ loaded: 1024 }));
+    expect(screen.getByText("1 KB transferred")).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "Upload progress" }).hasAttribute("value")).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Cancel upload" }));
+    expect(await screen.findByText("Upload cancelled. You can retry this file.")).toBeTruthy();
+  });
+
+  it("aborts the request and never reports cancellation as success", async () => {
+    let signal;
+    api.uploadDocument.mockImplementation((_formData, options) => {
+      signal = options.signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          reject(Object.assign(new Error("canceled"), { name: "CanceledError", code: "ERR_CANCELED" }));
+        }, { once: true });
+      });
+    });
+    const user = await openApp();
+    const input = screen.getByLabelText("Document file");
+    const file = new File(["test"], "report.pdf");
+    await user.upload(input, file);
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+    await screen.findByText("Uploading file…");
+    await user.click(screen.getByRole("button", { name: "Cancel upload" }));
+
+    expect(signal.aborted).toBe(true);
+    expect(await screen.findByText("Upload cancelled. You can retry this file.")).toBeTruthy();
+    expect(screen.queryByText("Document uploaded successfully.")).toBeNull();
+    expect(input.files[0]).toBe(file);
+    expect(screen.getByRole("button", { name: "Upload", exact: true }).disabled).toBe(false);
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("keeps a failed file retryable and accepts a subsequent upload", async () => {
+    api.uploadDocument
+      .mockRejectedValueOnce({ response: { data: { detail: "Storage unavailable" } } })
+      .mockResolvedValue({ data: { id: 1 } });
+    const user = await openApp();
+    const input = screen.getByLabelText("Document file");
+    const firstFile = new File(["first"], "first.pdf");
+    await user.upload(input, firstFile);
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Storage unavailable");
+    expect(screen.getByRole("status").textContent).toContain("Upload failed");
+    expect(input.files[0]).toBe(firstFile);
+    expect(screen.getByRole("button", { name: "Upload", exact: true }).disabled).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+    expect((await screen.findByText("Document uploaded successfully.")).textContent).toBe("Document uploaded successfully.");
+    expect(input.files).toHaveLength(0);
+
+    await user.upload(input, new File(["second"], "second.pdf"));
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+    await waitFor(() => expect(api.uploadDocument).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("status").textContent).toBe("Document uploaded successfully.");
+  });
+
+  it("aborts an active upload when the App unmounts", async () => {
+    let signal;
+    api.uploadDocument.mockImplementation((_formData, options) => {
+      signal = options.signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(Object.assign(new Error("canceled"), { name: "CanceledError" })), { once: true });
+      });
+    });
+    const user = await openApp();
+    await user.upload(screen.getByLabelText("Document file"), new File(["test"], "report.pdf"));
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+    await screen.findByText("Uploading file…");
+
+    cleanup();
+    expect(signal.aborted).toBe(true);
+    await act(async () => {});
+  });
+
+  it("aborts an active upload on logout", async () => {
+    let signal;
+    api.uploadDocument.mockImplementation((_formData, options) => {
+      signal = options.signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(Object.assign(new Error("canceled"), { name: "CanceledError" })), { once: true });
+      });
+    });
+    const user = await openApp();
+    await user.upload(screen.getByLabelText("Document file"), new File(["test"], "report.pdf"));
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+    await screen.findByText("Uploading file…");
+    await user.click(screen.getByRole("button", { name: /Logout/ }));
+
+    expect(signal.aborted).toBe(true);
+    expect(await screen.findByRole("heading", { name: "Sign in to your account" })).toBeTruthy();
+  });
+
+  it("preserves the 10MB client-side validation", async () => {
+    const user = await openApp();
+    const file = new File(["small body"], "large.pdf");
+    Object.defineProperty(file, "size", { value: 10 * 1024 * 1024 + 1 });
+    await user.upload(screen.getByLabelText("Document file"), file);
+    await user.click(screen.getByRole("button", { name: "Upload", exact: true }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Maximum allowed size is 10MB");
+    expect(api.uploadDocument).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Upload", exact: true }).disabled).toBe(false);
+  });
+});
