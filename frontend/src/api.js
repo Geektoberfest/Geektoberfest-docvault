@@ -37,6 +37,10 @@ export const uploadDocument = (formData) => api.post('/documents/upload', formDa
   }
 });
 export const deleteDocument = (id) => api.delete(`/documents/${id}`);
+export const downloadDocument = (id, signal) => api.get(`/documents/${id}/download`, {
+  responseType: 'blob',
+  signal,
+});
 export const searchDocuments = (q) => api.get(`/documents/search?q=${q}`);
 
 // Folder endpoints

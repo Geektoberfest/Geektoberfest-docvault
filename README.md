@@ -85,6 +85,54 @@ npm run dev
 ```
 The React application will be available at `http://localhost:5173`.
 
+## Download safety and integrity
+
+Downloads require the existing owner authentication check. Missing and foreign
+document IDs both return the same 404. The browser uses the authenticated Axios
+client and a temporary blob URL, so the document list no longer places tokens in
+download URLs. Backend query-token authentication remains available for existing
+clients. Download failures show actionable messages without displaying raw server
+responses or internal paths.
+
+The configured storage root is `UPLOAD_DIR` in `backend/app/routes/documents.py`
+(currently `uploads`, relative to the backend working directory). Existing flat
+relative paths and absolute paths inside that root are supported. Traversal,
+outside paths, nested storage paths, alternate streams, and multiply linked files
+are rejected. Storage and its ancestors must remain controlled by the application
+operator. On POSIX, the source is opened relative to a pinned directory descriptor
+with no-follow flags. On Windows, native handles pin the root and deny source
+writes/deletion during copying; the actual opened destination is checked before
+reading, including junction/symlink redirection.
+
+Before response headers are sent, the source is copied in bounded chunks into a
+private temporary snapshot. Regular-file type, persisted upload-derived size
+(when present), copied length, and source metadata stability are checked. Legacy
+rows with no size use the measured snapshot length; invalid or mismatching sizes
+return 409. Missing paths and rejected storage names return 404; inaccessible
+filesystem objects, read, temporary-storage, or audit failures return a sanitized
+503. Snapshots are closed after transmission or
+disconnect, and responses use their exact length and an encoded attachment name.
+
+There is **no trusted checksum baseline on current main**. No checksum is created,
+backfilled, or claimed as historical integrity proof; same-size corruption may
+remain undetected. Issue #31's proposed upload hashes are not assumed to exist.
+The snapshot prevents later source replacement from changing the response, but
+network failures or temporary-file read errors after headers are committed can
+still interrupt delivery; HTTP status cannot then be rewritten. The frontend
+reports request failures and waits for the complete Axios blob response before
+offering a save; it does not compare encoded wire size to decoded blob size. Single
+byte ranges are supported after full snapshot validation. Multipart/unsupported
+ranges and unmatched `If-Range` conditions receive the full response; no ETag or
+checksum validator is invented.
+Concurrent downloads consume temporary disk space. Audit events record a prepared
+download, not proof that the browser saved it.
+
+PR #19's version-history endpoints are not yet on main. When integrating it,
+reuse these protections for version downloads with each version's size metadata,
+and retain the separate version-upload API. PRs #40 and #41 also overlap the
+document-list component and Axios module; keep their account and upload behavior
+when resolving those files.
+
 ## Folder names
 
 Folder creation and renaming trim leading and trailing whitespace and reject empty

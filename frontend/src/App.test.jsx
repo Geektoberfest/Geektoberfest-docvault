@@ -9,7 +9,7 @@ vi.mock("./api", () => ({
   default: { get: vi.fn(), defaults: { baseURL: "https://api.test" } },
   getMe: vi.fn(), getFolders: vi.fn(),
   createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
-  uploadDocument: vi.fn(), deleteDocument: vi.fn(), searchDocuments: vi.fn(),
+  uploadDocument: vi.fn(), deleteDocument: vi.fn(), downloadDocument: vi.fn(), searchDocuments: vi.fn(),
   login: vi.fn(), register: vi.fn(),
 }));
 
@@ -20,6 +20,86 @@ beforeEach(() => {
   api.default.get.mockResolvedValue({ data: [] });
   api.searchDocuments.mockResolvedValue({ data: [] });
   api.getFolders.mockResolvedValue({ data: [{ id: 1, name: "Reports" }] });
+});
+
+describe("protected document downloads", () => {
+  const file = { id: 72, original_filename: "r\u00e9sum\u00e9.pdf", file_size: 5,
+    content_type: "application/pdf", created_at: "2026-01-01", folder_id: null };
+
+  beforeEach(() => {
+    api.default.get.mockResolvedValue({ data: [file] });
+    vi.stubGlobal("URL", class extends URL {
+      static createObjectURL = vi.fn(() => "blob:private-download");
+      static revokeObjectURL = vi.fn();
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("downloads through the authenticated client without a token URL and releases resources", async () => {
+    api.downloadDocument.mockResolvedValue({ data: new Blob(["hello"]), headers: { "content-length": "5" } });
+    const user = await openApp();
+    await user.click(await screen.findByRole("button", { name: "Download r\u00e9sum\u00e9.pdf" }));
+    expect(api.downloadDocument).toHaveBeenCalledWith(72, expect.any(AbortSignal));
+    expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:private-download"));
+    expect(document.querySelector('a[download]')).toBeNull();
+    expect(document.querySelector('a[href*="token="]')).toBeNull();
+  });
+
+  it.each([
+    [401, "sign in again"], [403, "no longer have access"], [404, "no longer have access"],
+    [409, "integrity check"], [503, "try again"], [undefined, "Check your connection"],
+  ])("shows safe feedback for status %s and restores the download button", async (status, message) => {
+    api.downloadDocument.mockRejectedValue({ response: { status, data: "C:/private/internal/storage/secret.pdf" } });
+    const user = await openApp();
+    const button = await screen.findByRole("button", { name: "Download r\u00e9sum\u00e9.pdf" });
+    await user.click(button);
+    expect((await screen.findByRole("alert")).textContent).toContain(message);
+    expect(screen.getByRole("alert").textContent).not.toContain("private/internal");
+    expect(button.disabled).toBe(false);
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it("allows a successful retry after an integrity failure", async () => {
+    api.downloadDocument.mockRejectedValueOnce({ response: { status: 409 } })
+      .mockResolvedValueOnce({ data: new Blob(["hello"]), headers: { "content-length": "5" } });
+    const user = await openApp();
+    const button = await screen.findByRole("button", { name: "Download r\u00e9sum\u00e9.pdf" });
+    await user.click(button);
+    expect((await screen.findByRole("alert")).textContent).toContain("integrity check");
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    await user.click(button);
+    await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledTimes(1));
+  });
+
+  it("aborts on logout and ignores a late response", async () => {
+    let complete;
+    api.downloadDocument.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
+    const user = await openApp();
+    const button = await screen.findByRole("button", { name: "Download r\u00e9sum\u00e9.pdf" });
+    await user.click(button);
+    expect(button.disabled).toBe(true);
+    expect(screen.getByRole("status").textContent).toContain("Preparing download");
+    const signal = api.downloadDocument.mock.lastCall[1];
+    await user.click(screen.getByRole("button", { name: /Logout/ }));
+    expect(signal.aborted).toBe(true);
+    await act(async () => complete({ data: new Blob(["hello"]), headers: {} }));
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it("aborts on unmount", async () => {
+    api.downloadDocument.mockImplementation(() => new Promise(() => {}));
+    const user = await openApp();
+    await user.click(await screen.findByRole("button", { name: "Download r\u00e9sum\u00e9.pdf" }));
+    const signal = api.downloadDocument.mock.lastCall[1];
+    cleanup();
+    expect(signal.aborted).toBe(true);
+  });
 });
 
 afterEach(() => {

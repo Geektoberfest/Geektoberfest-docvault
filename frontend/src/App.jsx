@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { formatFileSize } from "./formatFileSize.js";
+import { downloadErrorMessage, saveDownload } from "./download.js";
 import api, {
   getDocuments,
   getFolders,
   uploadDocument,
   deleteDocument,
+  downloadDocument,
   createFolder,
   renameFolder,
   deleteFolder,
@@ -51,6 +53,7 @@ function App() {
 
   // App States
   const [selectedFileType, setSelectedFileType] = useState("all");
+  const [sortBy, setSortBy] = useState("date_desc");
   const [documents, setDocuments] = useState([]);
   const [folders, setFolders] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -67,6 +70,20 @@ function App() {
   const [uploadFile, setUploadFile] = useState(null);
   const [error, setError] = useState("");
   const [uploadSuccess, setUploadSuccess] = useState("");
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [showAudit, setShowAudit] = useState(false);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const downloadRequests = useRef(new Map());
+  const [downloadState, setDownloadState] = useState({ token: null, ids: [] });
+  const downloadingIds = downloadState.token === token ? downloadState.ids : [];
+
+  useEffect(() => {
+    const requests = downloadRequests.current;
+    return () => {
+      for (const controller of requests.values()) controller.abort();
+      requests.clear();
+    };
+  }, [token]);
 
   useEffect(() => {
     if (token) {
@@ -162,7 +179,32 @@ function App() {
   };
 
   const handleLogout = () => {
+    for (const controller of downloadRequests.current.values()) controller.abort();
+    downloadRequests.current.clear();
     setToken(null);
+  };
+
+  const handleDownload = async (doc) => {
+    if (downloadRequests.current.has(doc.id)) return;
+    const controller = new AbortController();
+    downloadRequests.current.set(doc.id, controller);
+    setError("");
+    setDownloadState((state) => ({ token, ids: [...(state.token === token ? state.ids : []), doc.id] }));
+    try {
+      const response = await downloadDocument(doc.id, controller.signal);
+      if (controller.signal.aborted || downloadRequests.current.get(doc.id) !== controller) return;
+      saveDownload(response, doc.original_filename);
+    } catch (err) {
+      if (!controller.signal.aborted && downloadRequests.current.get(doc.id) === controller) {
+        setError(downloadErrorMessage(err));
+      }
+    } finally {
+      if (downloadRequests.current.get(doc.id) === controller) {
+        downloadRequests.current.delete(doc.id);
+        setDownloadState((state) => state.token === token
+          ? { token, ids: state.ids.filter((id) => id !== doc.id) } : state);
+      }
+    }
   };
 
   const handleUpload = async (e) => {
@@ -538,9 +580,9 @@ function App() {
         {/* Main Content */}
         <div className="flex-1 overflow-hidden">
           {error && (
-            <div className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
+            <div role="alert" className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
               <p>{error}</p>
-              <button onClick={() => setError("")} className="font-bold">
+              <button aria-label="Dismiss error" onClick={() => setError("")} className="font-bold">
                 &times;
               </button>
             </div>
@@ -619,6 +661,7 @@ function App() {
               </div>
             </div>
 
+            {downloadingIds.length > 0 && <p role="status" className="p-4 text-sm text-gray-600">Preparing download…</p>}
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-gray-50 border-b text-gray-600 text-sm">
@@ -668,15 +711,16 @@ function App() {
                       </td>
                       <td className="p-4 text-right whitespace-nowrap">
                         <div className="flex justify-end gap-2">
-                          <a
-                            href={`${api.defaults.baseURL}/documents/${doc.id}/download?token=${token}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="p-2 text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
+                          <button
+                            type="button"
+                            onClick={() => handleDownload(doc)}
+                            aria-label={`Download ${doc.original_filename}`}
+                            disabled={downloadingIds.includes(doc.id)}
+                            className="p-2 text-indigo-600 hover:bg-indigo-50 rounded transition-colors disabled:opacity-50"
                             title="Download"
                           >
                             <FiDownload />
-                          </a>
+                          </button>
                           <button
                             onClick={() => handleDeleteDoc(doc.id)}
                             className="p-2 text-red-600 hover:bg-red-50 rounded transition-colors"
