@@ -72,6 +72,46 @@ describe("folder creation", () => {
   });
 });
 
+describe("document upload quota errors", () => {
+  it("shows the allowance and remaining capacity without false success, then allows retry", async () => {
+    api.uploadDocument
+      .mockRejectedValueOnce({
+        response: { data: { detail: {
+          code: "STORAGE_QUOTA_EXCEEDED",
+          quota_bytes: 104857600,
+          remaining_bytes: 0,
+        } } },
+      })
+      .mockResolvedValueOnce({ data: {} });
+    const user = await openApp();
+    const fileInput = document.querySelector('input[type="file"]');
+    await user.upload(fileInput, new File(["x"], "notes.txt", { type: "text/plain" }));
+    const upload = screen.getByRole("button", { name: /upload/i });
+    await user.click(upload);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Storage quota reached");
+    expect(alert.textContent).toContain("100 MB");
+    expect(alert.textContent).toContain("0 B remained");
+    expect(screen.queryByText("Document uploaded successfully!")).toBeNull();
+    expect(upload.disabled).toBe(false);
+    expect(fileInput.files[0].name).toBe("notes.txt");
+
+    await user.click(upload);
+    expect(await screen.findByText("Document uploaded successfully!")).toBeTruthy();
+    expect(api.uploadDocument).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the fallback for unrelated upload errors", async () => {
+    api.uploadDocument.mockRejectedValue({ response: { data: { detail: "Upload unavailable" } } });
+    const user = await openApp();
+    await user.upload(document.querySelector('input[type="file"]'), new File(["x"], "notes.txt"));
+    await user.click(screen.getByRole("button", { name: /upload/i }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Upload unavailable");
+    expect(screen.queryByText("Document uploaded successfully!")).toBeNull();
+  });
+});
+
 describe("folder renaming", () => {
   it("rejects blank names and keeps the editor open", async () => {
     const user = await openApp();

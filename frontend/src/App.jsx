@@ -38,6 +38,18 @@ function folderErrorMessage(err, fallback) {
   return fallback;
 }
 
+function uploadErrorMessage(err) {
+  const detail = err.response?.data?.detail;
+  if (detail?.code === "STORAGE_QUOTA_EXCEEDED") {
+    const quota = Number.isSafeInteger(detail.quota_bytes) ? formatFileSize(detail.quota_bytes) : "your storage allowance";
+    const remaining = Number.isSafeInteger(detail.remaining_bytes)
+      ? ` ${formatFileSize(detail.remaining_bytes)} remained before this upload.`
+      : "";
+    return `Storage quota reached. Your allowance is ${quota}.${remaining}`;
+  }
+  return folderErrorMessage(err, "Upload failed. Please check the file format and try again.");
+}
+
 function App() {
   const [token, setToken] = useState(localStorage.getItem("token"));
   const [user, setUser] = useState(null);
@@ -51,6 +63,7 @@ function App() {
 
   // App States
   const [selectedFileType, setSelectedFileType] = useState("all");
+  const [sortBy, setSortBy] = useState("date_desc");
   const [documents, setDocuments] = useState([]);
   const [folders, setFolders] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -67,6 +80,9 @@ function App() {
   const [uploadFile, setUploadFile] = useState(null);
   const [error, setError] = useState("");
   const [uploadSuccess, setUploadSuccess] = useState("");
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [showAudit, setShowAudit] = useState(false);
+  const [auditLoading, setAuditLoading] = useState(false);
 
   useEffect(() => {
     if (token) {
@@ -196,8 +212,7 @@ function App() {
     fetchDocuments();
   } catch (err) {
     console.error(err);
-    const message = err.response?.data?.detail || "Upload failed. Please check the file format and try again.";
-    setError(message);
+    setError(uploadErrorMessage(err));
   }
 };
 
@@ -538,7 +553,7 @@ function App() {
         {/* Main Content */}
         <div className="flex-1 overflow-hidden">
           {error && (
-            <div className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
+            <div role="alert" className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
               <p>{error}</p>
               <button onClick={() => setError("")} className="font-bold">
                 &times;

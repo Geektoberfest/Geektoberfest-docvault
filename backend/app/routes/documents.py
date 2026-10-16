@@ -1,11 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, Request
 from fastapi.responses import FileResponse
+from sqlalchemy import func
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
 import uuid
 import shutil
+import tempfile
 from .. import models, schemas, auth
+from ..config import DOCUMENT_STORAGE_QUOTA_BYTES
 from ..database import get_db
 from ..audit_logger import log_event
 from ..access import get_owned_document, get_owned_folder
@@ -23,54 +27,95 @@ def upload_document(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    # Read file size
-    file.file.seek(0, 2)
-    file_size = file.file.tell()
-    file.file.seek(0)
-
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large. Max size is 10MB.")
-
     # Check folder if provided
     if folder_id:
         folder = get_owned_folder(db, folder_id, current_user)
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found or you don't have access")
 
-    # Generate unique filename to avoid conflicts
-    file_ext = os.path.splitext(file.filename)[1]
-    unique_filename = f"{uuid.uuid4()}{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    staged_path = None
+    file_path = None
+    committed = False
+    try:
+        with tempfile.NamedTemporaryFile(dir=UPLOAD_DIR, prefix=".upload-", delete=False) as staged:
+            staged_path = staged.name
+            shutil.copyfileobj(file.file, staged)
+        file_size = os.path.getsize(staged_path)
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="File too large. Max size is 10MB.")
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        # Locking the user's row serializes uploads for this owner. Under
+        # PostgreSQL READ COMMITTED, the following SUM sees the prior upload's
+        # commit after this lock becomes available.
+        db.query(models.User.id).filter(models.User.id == current_user.id).with_for_update().one()
+        used_bytes = db.query(func.coalesce(func.sum(models.Document.file_size), 0)).filter(
+            models.Document.owner_id == current_user.id,
+            models.Document.file_size >= 0,
+        ).scalar()
+        used_bytes = int(used_bytes or 0)
+        remaining_bytes = max(0, DOCUMENT_STORAGE_QUOTA_BYTES - used_bytes)
+        if file_size > remaining_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "STORAGE_QUOTA_EXCEEDED",
+                    "quota_bytes": DOCUMENT_STORAGE_QUOTA_BYTES,
+                    "used_bytes": used_bytes,
+                    "incoming_bytes": file_size,
+                    "remaining_bytes": remaining_bytes,
+                },
+            )
 
-    new_doc = models.Document(
-        filename=unique_filename,
-        original_filename=file.filename,
-        file_path=file_path,
-        file_size=file_size,
-        content_type=file.content_type,
-        folder_id=folder_id,
-        owner_id=current_user.id
-    )
+        file_ext = os.path.splitext(file.filename or "")[1]
+        unique_filename = f"{uuid.uuid4()}{file_ext}"
+        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+        os.replace(staged_path, file_path)
+        staged_path = None
 
-    db.add(new_doc)
-    db.flush()  # assign new_doc.id before logging
-
-    log_event(
-        db,
-        user_id=current_user.id,
-        action="upload",
-        target_type="document",
-        target_id=new_doc.id,
-        target_name=file.filename,
-        ip_address=request.client.host if request.client else None,
-    )
-
-    db.commit()
-    db.refresh(new_doc)
-    return new_doc
+        new_doc = models.Document(
+            filename=unique_filename,
+            original_filename=file.filename,
+            file_path=file_path,
+            file_size=file_size,
+            content_type=file.content_type,
+            folder_id=folder_id,
+            owner_id=current_user.id,
+        )
+        db.add(new_doc)
+        db.flush()
+        log_event(
+            db,
+            user_id=current_user.id,
+            action="upload",
+            target_type="document",
+            target_id=new_doc.id,
+            target_name=file.filename,
+            ip_address=request.client.host if request.client else None,
+        )
+        db.commit()
+        committed = True
+        db.refresh(new_doc)
+        return new_doc
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Upload could not be saved") from None
+    except OSError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Upload storage is unavailable") from None
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Upload could not be saved") from None
+    finally:
+        for path in (staged_path, file_path if not committed else None):
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 # fixed : 
 @router.get("/", response_model=List[schemas.DocumentResponse])

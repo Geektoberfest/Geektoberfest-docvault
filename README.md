@@ -20,6 +20,7 @@ The frontend is deployed on Vercel, and the FastAPI backend is hosted on Render.
 
 - **User Authentication:** Register and log in securely with JWT
 - Upload and manage personal documents (up to 10MB)
+- Store up to 100 MiB of documents per account by default; configure `DOCUMENT_STORAGE_QUOTA_BYTES` on the backend to change the byte limit
 - Readable document sizes in B, KB, or MB using 1024-based units (up to two decimal places, without trailing zeros); zero-byte files show `0 B` and invalid sizes show `Unknown`
 - Documents and folders are completely private to the owner
 - Download documents
@@ -75,6 +76,18 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 The API will be available at `http://localhost:8000`.
+
+`DOCUMENT_STORAGE_QUOTA_BYTES` sets the per-user aggregate storage allowance in
+bytes. It defaults to 104857600 (100 MiB) and must be a positive integer no
+larger than 9223372036854775807. Usage is the sum of persisted document sizes
+for that user, including documents uploaded before quotas were enabled. The
+existing 10 MiB per-file limit remains independent. Uploads exactly reaching
+the quota are accepted; larger uploads return HTTP 413 with the
+`STORAGE_QUOTA_EXCEEDED` error code. This proposed default and accounting policy
+are subject to maintainer review. Upload data is staged before the quota
+transaction; uploads for one account then serialize on that user's database row
+under PostgreSQL `READ COMMITTED`, so simultaneous requests see prior commits
+without holding the lock while the file is received.
 
 ### 3. Frontend Setup
 

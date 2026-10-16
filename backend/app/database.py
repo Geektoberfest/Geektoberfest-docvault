@@ -7,7 +7,7 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:password@localhost:5432/document_manager")
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, isolation_level="READ COMMITTED")
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
