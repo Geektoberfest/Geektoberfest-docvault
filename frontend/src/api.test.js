@@ -7,7 +7,7 @@ const mockApi = vi.hoisted(() => ({
 
 vi.mock("axios", () => ({ default: { create: () => mockApi } }));
 
-import api, { uploadDocument } from "./api";
+import api, { bulkDeleteDocuments, uploadDocument } from "./api";
 
 describe("uploadDocument request options", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -24,5 +24,10 @@ describe("uploadDocument request options", () => {
       signal: controller.signal,
       onUploadProgress,
     });
+  });
+
+  it("preserves the bulk-delete Axios contract", () => {
+    bulkDeleteDocuments([4, 5]);
+    expect(api.post).toHaveBeenCalledWith("/documents/bulk-delete", { document_ids: [4, 5] });
   });
 });

@@ -9,7 +9,7 @@ vi.mock("./api", () => ({
   default: { get: vi.fn(), defaults: { baseURL: "https://api.test" } },
   getMe: vi.fn(), getFolders: vi.fn(),
   createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
-  uploadDocument: vi.fn(), deleteDocument: vi.fn(), searchDocuments: vi.fn(),
+  uploadDocument: vi.fn(), deleteDocument: vi.fn(), bulkDeleteDocuments: vi.fn(), searchDocuments: vi.fn(),
   login: vi.fn(), register: vi.fn(),
 }));
 
@@ -384,5 +384,28 @@ describe("document upload progress and cancellation", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("Maximum allowed size is 10MB");
     expect(api.uploadDocument).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Upload", exact: true }).disabled).toBe(false);
+  });
+});
+
+describe("bulk actions remain available with upload progress", () => {
+  it("refreshes after partial deletion and retains failed documents for retry", async () => {
+    const removed = makeDocument(70, "removed.pdf", 1, "application/pdf");
+    const failed = makeDocument(71, "failed.pdf", 1, "application/pdf");
+    let deletionCompleted = false;
+    api.default.get.mockImplementation(() => ({ data: deletionCompleted ? [failed] : [removed, failed] }));
+    api.bulkDeleteDocuments.mockImplementation(async () => {
+      deletionCompleted = true;
+      return { data: { total_deleted: 1, deleted_ids: [removed.id], failed: [{ id: failed.id, reason: "Access denied" }] } };
+    });
+    const user = await openApp();
+    await user.click(screen.getByRole("checkbox", { name: "Select all visible documents" }));
+    await user.click(screen.getByRole("button", { name: "Delete Selected" }));
+    await user.click(screen.getByRole("button", { name: "Delete Permanently" }));
+
+    expect(await screen.findByText("Deleted 1 document(s). Failed to delete 1 document(s).")).toBeTruthy();
+    await waitFor(() => expect(api.bulkDeleteDocuments).toHaveBeenCalledWith([removed.id, failed.id]));
+    expect(screen.queryByText(removed.original_filename)).toBeNull();
+    expect(screen.getByText(failed.original_filename)).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: `Select document ${failed.original_filename}` }).checked).toBe(true);
   });
 });
