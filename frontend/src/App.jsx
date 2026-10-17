@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { formatFileSize } from "./formatFileSize.js";
+import { downloadErrorMessage, saveDownload } from "./download.js";
 import api, {
   getDocuments,
   getFolders,
   uploadDocument,
   deleteDocument,
+  downloadDocument,
   bulkDeleteDocuments,
   createFolder,
   renameFolder,
@@ -52,6 +54,7 @@ function App() {
 
   // App States
   const [selectedFileType, setSelectedFileType] = useState("all");
+  const [sortBy, setSortBy] = useState("date_desc");
   const [documents, setDocuments] = useState([]);
   const [folders, setFolders] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -68,19 +71,39 @@ function App() {
   const [uploadFile, setUploadFile] = useState(null);
   const [error, setError] = useState("");
   const [uploadSuccess, setUploadSuccess] = useState("");
-  const [sortBy, setSortBy] = useState("date_desc");
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [showAudit, setShowAudit] = useState(false);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const downloadRequests = useRef(new Map());
+  const [downloadState, setDownloadState] = useState({ token: null, ids: [] });
+  const downloadingIds = downloadState.token === token ? downloadState.ids : [];
   const [selectedDocIds, setSelectedDocIds] = useState(new Set());
   const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
   const [bulkMessage, setBulkMessage] = useState("");
-
-  // Audit log state
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [showAudit, setShowAudit] = useState(false);
-  const [auditLoading, setAuditLoading] = useState(false);
-
+  const tokenRef = useRef(token);
+  const setCurrentToken = (nextToken) => {
+    tokenRef.current = nextToken;
+    setToken(nextToken);
+  };
 
   useEffect(() => {
+    const requests = downloadRequests.current;
+    return () => {
+      for (const controller of requests.values()) controller.abort();
+      requests.clear();
+    };
+  }, [token]);
+
+  useEffect(() => {
+    tokenRef.current = token;
+    latestDocumentRequest.current += 1;
+    setDocuments([]);
+    setFolders([]);
+    setSelectedDocIds(new Set());
+    setIsBulkDeleting(false);
+    setShowBulkDeleteConfirm(false);
+    setBulkMessage("");
     if (token) {
       localStorage.setItem("token", token);
       fetchMe();
@@ -98,7 +121,7 @@ function App() {
       fetchFolders();
     } catch (err) {
       console.error(err);
-      setToken(null); // Invalid token
+      setCurrentToken(null); // Invalid token
     }
   };
 
@@ -161,7 +184,7 @@ function App() {
     try {
       if (isLoginView) {
         const res = await login(authUsername, authPassword);
-        setToken(res.data.access_token);
+        setCurrentToken(res.data.access_token);
       } else {
         await register(authUsername, authEmail, authPassword);
         setIsLoginView(true);
@@ -174,7 +197,32 @@ function App() {
   };
 
   const handleLogout = () => {
-    setToken(null);
+    for (const controller of downloadRequests.current.values()) controller.abort();
+    downloadRequests.current.clear();
+    setCurrentToken(null);
+  };
+
+  const handleDownload = async (doc) => {
+    if (downloadRequests.current.has(doc.id)) return;
+    const controller = new AbortController();
+    downloadRequests.current.set(doc.id, controller);
+    setError("");
+    setDownloadState((state) => ({ token, ids: [...(state.token === token ? state.ids : []), doc.id] }));
+    try {
+      const response = await downloadDocument(doc.id, controller.signal);
+      if (controller.signal.aborted || downloadRequests.current.get(doc.id) !== controller) return;
+      saveDownload(response, doc.original_filename);
+    } catch (err) {
+      if (!controller.signal.aborted && downloadRequests.current.get(doc.id) === controller) {
+        setError(downloadErrorMessage(err));
+      }
+    } finally {
+      if (downloadRequests.current.get(doc.id) === controller) {
+        downloadRequests.current.delete(doc.id);
+        setDownloadState((state) => state.token === token
+          ? { token, ids: state.ids.filter((id) => id !== doc.id) } : state);
+      }
+    }
   };
 
   const handleUpload = async (e) => {
@@ -217,8 +265,10 @@ function App() {
     if (!window.confirm("Are you sure you want to delete this document?")) {
       return;
     }
+    const requestToken = token;
     try {
       await deleteDocument(id);
+      if (tokenRef.current !== requestToken) return;
       setSelectedDocIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
@@ -226,6 +276,7 @@ function App() {
       });
       fetchDocuments();
     } catch (err) {
+      if (tokenRef.current !== requestToken) return;
       console.error(err);
       setError("Failed to delete document");
     }
@@ -263,24 +314,27 @@ function App() {
 
   const handleBulkDelete = async () => {
     if (selectedDocIds.size === 0) return;
+    const requestToken = token;
     setIsBulkDeleting(true);
     setBulkMessage("");
     try {
       const res = await bulkDeleteDocuments(Array.from(selectedDocIds));
+      if (tokenRef.current !== requestToken) return;
       const { total_deleted, failed } = res.data;
       if (failed && failed.length > 0) {
         setBulkMessage(`Deleted ${total_deleted} document(s). Failed to delete ${failed.length} document(s).`);
       } else {
         setBulkMessage(`Successfully deleted ${total_deleted} document(s).`);
       }
-      setSelectedDocIds(new Set());
+      setSelectedDocIds(new Set((failed || []).map(({ id }) => id)));
       setShowBulkDeleteConfirm(false);
       fetchDocuments();
     } catch (err) {
+      if (tokenRef.current !== requestToken) return;
       console.error(err);
       setError(err.response?.data?.detail || "Failed to perform bulk deletion");
     } finally {
-      setIsBulkDeleting(false);
+      if (tokenRef.current === requestToken) setIsBulkDeleting(false);
     }
   };
 
@@ -608,9 +662,9 @@ function App() {
         {/* Main Content */}
         <div className="flex-1 overflow-hidden">
           {error && (
-            <div className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
+            <div role="alert" className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-sm flex justify-between">
               <p>{error}</p>
-              <button onClick={() => setError("")} className="font-bold">
+              <button aria-label="Dismiss error" onClick={() => setError("")} className="font-bold">
                 &times;
               </button>
             </div>
@@ -689,6 +743,8 @@ function App() {
               </div>
             </div>
 
+            {downloadingIds.length > 0 && <p role="status" className="p-4 text-sm text-gray-600">Preparing download…</p>}
+
             {bulkMessage && (
               <div className="mb-4 p-3 bg-blue-50 border border-blue-200 text-blue-700 rounded-md text-sm flex justify-between items-center">
                 <span>{bulkMessage}</span>
@@ -720,7 +776,6 @@ function App() {
                 </div>
               </div>
             )}
-
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-gray-50 border-b text-gray-600 text-sm">
@@ -788,15 +843,16 @@ function App() {
                       </td>
                       <td className="p-4 text-right whitespace-nowrap">
                         <div className="flex justify-end gap-2">
-                          <a
-                            href={`${api.defaults.baseURL}/documents/${doc.id}/download?token=${token}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="p-2 text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
+                          <button
+                            type="button"
+                            onClick={() => handleDownload(doc)}
+                            aria-label={`Download ${doc.original_filename}`}
+                            disabled={downloadingIds.includes(doc.id)}
+                            className="p-2 text-indigo-600 hover:bg-indigo-50 rounded transition-colors disabled:opacity-50"
                             title="Download"
                           >
                             <FiDownload />
-                          </a>
+                          </button>
                           <button
                             onClick={() => handleDeleteDoc(doc.id)}
                             className="p-2 text-red-600 hover:bg-red-50 rounded transition-colors"

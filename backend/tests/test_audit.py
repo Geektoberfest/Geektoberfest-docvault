@@ -103,7 +103,8 @@ class AuditTestBase(unittest.TestCase):
         self.db.add(doc)
         self.db.commit()
         self.db.refresh(doc)
-        open(doc.file_path, "wb").close()
+        with open(doc.file_path, "wb") as stored_file:
+            stored_file.write(b"\0" * doc.file_size)
         return doc
 
     def _audit_logs(self, as_user=None):

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, Request
-from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 from typing import List, Optional
 import os
 import uuid
@@ -9,6 +9,7 @@ from .. import models, schemas, auth
 from ..database import get_db
 from ..audit_logger import log_event
 from ..access import get_owned_document, get_owned_folder
+from ..downloads import DownloadResponse, prepare_download
 
 router = APIRouter()
 UPLOAD_DIR = "uploads"
@@ -121,25 +122,26 @@ def download_document(request: Request, doc_id: int, db: Session = Depends(get_d
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
-    if not os.path.exists(doc.file_path):
-        raise HTTPException(status_code=404, detail="File not found on server")
-
-    log_event(
-        db,
-        user_id=current_user.id,
-        action="download",
-        target_type="document",
-        target_id=doc.id,
-        target_name=doc.original_filename,
-        ip_address=request.client.host if request.client else None,
-    )
-    db.commit()
-
-    return FileResponse(
-        path=doc.file_path,
-        filename=doc.original_filename,
-        media_type=doc.content_type
-    )
+    snapshot, length = prepare_download(doc.file_path, UPLOAD_DIR, doc.file_size)
+    try:
+        log_event(
+            db,
+            user_id=current_user.id,
+            action="download",
+            target_type="document",
+            target_id=doc.id,
+            target_name=doc.original_filename,
+            ip_address=request.client.host if request.client else None,
+        )
+        db.commit()
+        return DownloadResponse(snapshot, length, doc.original_filename, doc.content_type)
+    except SQLAlchemyError:
+        snapshot.close()
+        db.rollback()
+        raise HTTPException(503, "Download temporarily unavailable. Try again later.") from None
+    except Exception:
+        snapshot.close()
+        raise
 
 @router.post("/bulk-delete", response_model=schemas.BulkDeleteResponse)
 def bulk_delete_documents(
