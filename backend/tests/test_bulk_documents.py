@@ -1,6 +1,7 @@
 import unittest
 import os
 import tempfile
+from unittest import mock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -132,3 +133,42 @@ class BulkDocumentTests(unittest.TestCase):
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0].target_id, self.doc1.id)
         self.assertEqual(logs[0].target_name, "report1.pdf")
+
+    def test_bulk_delete_preserves_record_when_file_removal_fails(self):
+        remove_file = os.remove
+
+        def fail_first_file(path):
+            if path == self.file_alice1:
+                raise PermissionError("private filesystem detail")
+            remove_file(path)
+
+        with mock.patch.object(documents.os, "remove", side_effect=fail_first_file):
+            response = self.client.post(
+                "/documents/bulk-delete",
+                json={"document_ids": [self.doc1.id, self.doc2.id]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["total_requested"], 2)
+        self.assertEqual(data["total_deleted"], 1)
+        self.assertEqual(data["deleted_ids"], [self.doc2.id])
+        self.assertEqual(data["failed"], [{"id": self.doc1.id, "reason": "File could not be deleted"}])
+        self.assertTrue(os.path.exists(self.file_alice1))
+        self.assertFalse(os.path.exists(self.file_alice2))
+        self.assertIsNotNone(self.db.query(models.Document).filter_by(id=self.doc1.id).first())
+        self.assertIsNone(self.db.query(models.Document).filter_by(id=self.doc2.id).first())
+        audit_ids = [row.target_id for row in self.db.query(models.AuditLog).filter_by(action="bulk_delete").all()]
+        self.assertEqual(audit_ids, [self.doc2.id])
+
+    def test_bulk_delete_processes_duplicate_ids_once(self):
+        response = self.client.post(
+            "/documents/bulk-delete",
+            json={"document_ids": [self.doc1.id, self.doc1.id]},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["total_requested"], 2)
+        self.assertEqual(data["total_deleted"], 1)
+        self.assertEqual(data["deleted_ids"], [self.doc1.id])
+        self.assertEqual(data["failed"], [{"id": self.doc1.id, "reason": "Duplicate document ID"}])

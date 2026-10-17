@@ -9,7 +9,7 @@ vi.mock("./api", () => ({
   default: { get: vi.fn(), defaults: { baseURL: "https://api.test" } },
   getMe: vi.fn(), getFolders: vi.fn(),
   createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
-  uploadDocument: vi.fn(), deleteDocument: vi.fn(), searchDocuments: vi.fn(),
+  uploadDocument: vi.fn(), deleteDocument: vi.fn(), bulkDeleteDocuments: vi.fn(), searchDocuments: vi.fn(),
   login: vi.fn(), register: vi.fn(),
 }));
 
@@ -69,6 +69,69 @@ describe("folder creation", () => {
     await waitFor(() => expect(input.value).toBe(""));
     expect(api.createFolder).toHaveBeenCalledWith("Archive");
     expect(api.getFolders).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("document upload quota errors", () => {
+  it("shows the allowance and remaining capacity without false success, then allows retry", async () => {
+    api.uploadDocument
+      .mockRejectedValueOnce({
+        response: { data: { detail: {
+          code: "STORAGE_QUOTA_EXCEEDED",
+          quota_bytes: 104857600,
+          remaining_bytes: 0,
+        } } },
+      })
+      .mockResolvedValueOnce({ data: {} });
+    const user = await openApp();
+    const fileInput = document.querySelector('input[type="file"]');
+    await user.upload(fileInput, new File(["x"], "notes.txt", { type: "text/plain" }));
+    const upload = screen.getByRole("button", { name: /upload/i });
+    await user.click(upload);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Storage quota reached");
+    expect(alert.textContent).toContain("100 MB");
+    expect(alert.textContent).toContain("0 B remained");
+    expect(screen.queryByText("Document uploaded successfully!")).toBeNull();
+    expect(upload.disabled).toBe(false);
+    expect(fileInput.files[0].name).toBe("notes.txt");
+
+    await user.click(upload);
+    expect(await screen.findByText("Document uploaded successfully!")).toBeTruthy();
+    expect(api.uploadDocument).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the fallback for unrelated upload errors", async () => {
+    api.uploadDocument.mockRejectedValue({ response: { data: { detail: "Upload unavailable" } } });
+    const user = await openApp();
+    await user.upload(document.querySelector('input[type="file"]'), new File(["x"], "notes.txt"));
+    await user.click(screen.getByRole("button", { name: /upload/i }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Upload unavailable");
+    expect(screen.queryByText("Document uploaded successfully!")).toBeNull();
+  });
+});
+
+describe("bulk deletion with quota accounting", () => {
+  it("refreshes after partial deletion and keeps failed files selected", async () => {
+    const removed = makeDocument(50, "removed.pdf", 1, "application/pdf");
+    const failed = makeDocument(51, "still-stored.pdf", 1, "application/pdf");
+    let deletionCompleted = false;
+    api.default.get.mockImplementation(() => ({ data: deletionCompleted ? [failed] : [removed, failed] }));
+    api.bulkDeleteDocuments.mockImplementation(async (_ids) => {
+      deletionCompleted = true;
+      return { data: { total_deleted: 1, deleted_ids: [removed.id], failed: [{ id: failed.id, reason: "File could not be deleted" }] } };
+    });
+    const user = await openApp();
+    await user.click(screen.getByRole("checkbox", { name: "Select all visible documents" }));
+    await user.click(screen.getByRole("button", { name: "Delete Selected" }));
+    await user.click(screen.getByRole("button", { name: "Delete Permanently" }));
+
+    expect(await screen.findByText("Deleted 1 document(s). Failed to delete 1 document(s).")).toBeTruthy();
+    await waitFor(() => expect(api.bulkDeleteDocuments).toHaveBeenCalledWith([removed.id, failed.id]));
+    expect(screen.queryByText(removed.original_filename)).toBeNull();
+    expect(screen.getByText(failed.original_filename)).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: `Select document ${failed.original_filename}` }).checked).toBe(true);
   });
 });
 
