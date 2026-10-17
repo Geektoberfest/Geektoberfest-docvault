@@ -31,10 +31,12 @@ export const getMe = () => api.get('/auth/me');
 
 // Document endpoints
 export const getDocuments = (q = '') => api.get(`/documents/?q=${q}`);
-export const uploadDocument = (formData) => api.post('/documents/upload', formData, {
+export const uploadDocument = (formData, { signal, onUploadProgress } = {}) => api.post('/documents/upload', formData, {
   headers: {
     'Content-Type': 'multipart/form-data'
-  }
+  },
+  signal,
+  onUploadProgress,
 });
 export const deleteDocument = (id) => api.delete(`/documents/${id}`);
 export const bulkDeleteDocuments = (documentIds) => api.post('/documents/bulk-delete', { document_ids: documentIds });
