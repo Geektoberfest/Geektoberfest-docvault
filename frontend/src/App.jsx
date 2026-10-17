@@ -16,6 +16,14 @@ import api, {
   getAuditLogs,
 } from "./api";
 import {
+  createFilterPreset,
+  deleteFilterPreset,
+  loadFilterPresets,
+  MAX_FILTER_PRESET_NAME_LENGTH,
+  normalizeFilterPreset,
+  saveFilterPresets,
+} from "./filterPresets";
+import {
   FiDownload,
   FiTrash2,
   FiFolder,
@@ -39,8 +47,16 @@ function folderErrorMessage(err, fallback) {
   return fallback;
 }
 
+function readAuthToken() {
+  try {
+    return localStorage.getItem("token");
+  } catch {
+    return null;
+  }
+}
+
 function App() {
-  const [token, setToken] = useState(localStorage.getItem("token"));
+  const [token, setToken] = useState(readAuthToken);
   const [user, setUser] = useState(null);
 
   // Auth States
@@ -52,12 +68,22 @@ function App() {
 
   // App States
   const [selectedFileType, setSelectedFileType] = useState("all");
+  const [sortBy, setSortBy] = useState("date_desc");
   const [documents, setDocuments] = useState([]);
   const [folders, setFolders] = useState([]);
+  const [foldersLoaded, setFoldersLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const searchInputRef = useRef(null);
   const latestDocumentRequest = useRef(0);
+  const accountGeneration = useRef(0);
   const [selectedFolder, setSelectedFolder] = useState(null);
+  const [savedFilterPresets, setSavedFilterPresets] = useState([]);
+  const [presetsLoaded, setPresetsLoaded] = useState(false);
+  const [presetName, setPresetName] = useState("");
+  const [selectedPresetName, setSelectedPresetName] = useState("");
+  const [presetMessage, setPresetMessage] = useState("");
+  const [presetError, setPresetError] = useState("");
+  const [presetStorageAvailable, setPresetStorageAvailable] = useState(true);
   const [newFolderName, setNewFolderName] = useState("");
   const [createFolderError, setCreateFolderError] = useState("");
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -68,7 +94,6 @@ function App() {
   const [uploadFile, setUploadFile] = useState(null);
   const [error, setError] = useState("");
   const [uploadSuccess, setUploadSuccess] = useState("");
-  const [sortBy, setSortBy] = useState("date_desc");
   const [selectedDocIds, setSelectedDocIds] = useState(new Set());
   const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
@@ -79,32 +104,84 @@ function App() {
   const [showAudit, setShowAudit] = useState(false);
   const [auditLoading, setAuditLoading] = useState(false);
 
-
   useEffect(() => {
-    if (token) {
-      localStorage.setItem("token", token);
-      fetchMe();
-    } else {
-      localStorage.removeItem("token");
-      setUser(null);
+    const generation = ++accountGeneration.current;
+    latestDocumentRequest.current += 1;
+    setUser(null);
+    setAuthPassword("");
+    setDocuments([]);
+    setFolders([]);
+    setFoldersLoaded(false);
+    setSelectedFolder(null);
+    setSelectedFileType("all");
+    setSortBy("date_desc");
+    setSearchQuery("");
+    setNewFolderName("");
+    setCreateFolderError("");
+    setCreatingFolder(false);
+    setEditingFolderId(null);
+    setRenameFolderName("");
+    setRenameFolderError("");
+    setRenamingFolder(false);
+    setUploadFile(null);
+    setSelectedDocIds(new Set());
+    setIsBulkDeleting(false);
+    setShowBulkDeleteConfirm(false);
+    setBulkMessage("");
+    setAuditLogs([]);
+    setShowAudit(false);
+    setAuditLoading(false);
+    setSavedFilterPresets([]);
+    setPresetsLoaded(false);
+    setPresetName("");
+    setSelectedPresetName("");
+    setPresetMessage("");
+    setPresetError("");
+    setPresetStorageAvailable(true);
+    setError("");
+    setUploadSuccess("");
+
+    try {
+      if (token) localStorage.setItem("token", token);
+      else localStorage.removeItem("token");
+    } catch {
+      // Auth and preset storage are unavailable in some browser contexts.
     }
+    if (token) fetchMe(generation);
+
+    return () => {
+      accountGeneration.current += 1;
+      latestDocumentRequest.current += 1;
+    };
   }, [token]);
 
-  const fetchMe = async () => {
+  const fetchMe = async (generation) => {
     try {
       const res = await getMe();
+      if (generation !== accountGeneration.current) return;
       setUser(res.data);
-      fetchDocuments();
-      fetchFolders();
+      const stored = loadFilterPresets(res.data.id);
+      setSavedFilterPresets(stored.presets);
+      setPresetsLoaded(true);
+      setPresetStorageAvailable(stored.storageAvailable);
+      setPresetError(
+        stored.error === "storage-unavailable"
+          ? "Saved presets are unavailable in this browser."
+          : stored.error === "invalid-data"
+            ? "Some saved presets were invalid and have been ignored."
+            : "",
+      );
+      fetchFolders(generation);
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       console.error(err);
       setToken(null); // Invalid token
     }
   };
 
   // supporting both filter and sort query params
-  const fetchDocuments = async () => {
-    if (!token) return;
+  const fetchDocuments = async (generation = accountGeneration.current) => {
+    if (!token || !user?.id) return;
     const requestId = ++latestDocumentRequest.current;
     try {
       const params = new URLSearchParams();
@@ -119,41 +196,57 @@ function App() {
       const res = await (searchQuery
         ? searchDocuments(searchQuery)
         : api.get(`/documents/${queryString}`));
-      if (requestId === latestDocumentRequest.current) setDocuments(res.data);
+      if (
+        generation === accountGeneration.current &&
+        requestId === latestDocumentRequest.current
+      ) {
+        setDocuments(res.data);
+      }
     } catch (err) {
-      if (requestId !== latestDocumentRequest.current) return;
+      if (
+        generation !== accountGeneration.current ||
+        requestId !== latestDocumentRequest.current
+      ) return;
       console.error(err);
       setError("Failed to fetch documents");
     }
   };
 
-  const fetchFolders = async () => {
+  const fetchFolders = async (generation = accountGeneration.current) => {
     if (!token) return;
     try {
       const res = await getFolders();
+      if (generation !== accountGeneration.current) return;
       setFolders(res.data);
+      setFoldersLoaded(true);
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       console.error(err);
+      setFoldersLoaded(true);
       setError("Failed to fetch folders");
     }
   };
 
   const fetchAuditLogs = async () => {
+    const generation = accountGeneration.current;
     setAuditLoading(true);
     try {
       const res = await getAuditLogs();
+      if (generation !== accountGeneration.current) return;
       setAuditLogs(res.data);
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       console.error(err);
       setError("Failed to fetch audit logs");
     } finally {
-      setAuditLoading(false);
+      if (generation === accountGeneration.current) setAuditLoading(false);
     }
   };
 
   useEffect(() => {
-    if (token) fetchDocuments();
-  }, [searchQuery, selectedFileType, sortBy]);
+    // oxlint-disable-next-line react/set-state-in-effect -- fetchDocuments updates state after its network request resolves.
+    if (token && user?.id) fetchDocuments();
+  }, [token, user?.id, searchQuery, selectedFileType, sortBy]);
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -174,10 +267,115 @@ function App() {
   };
 
   const handleLogout = () => {
+    accountGeneration.current += 1;
+    latestDocumentRequest.current += 1;
     setToken(null);
   };
 
+  const presetErrorMessage = (reason) => ({
+    "blank-name": "Enter a name for this preset.",
+    "name-too-long": `Preset names must be ${MAX_FILTER_PRESET_NAME_LENGTH} characters or fewer.`,
+    "duplicate-name": "A preset with that name already exists.",
+    "preset-limit": "You can save up to 20 presets.",
+    "invalid-filter": "The current filters cannot be saved as a preset.",
+    "storage-unavailable": "Saved presets are unavailable in this browser.",
+    "identity-unavailable": "Sign in again before saving a preset.",
+  }[reason] || "The preset could not be saved.");
+
+  const handleSavePreset = (event) => {
+    event.preventDefault();
+    setPresetError("");
+    setPresetMessage("");
+    if (!user?.id) {
+      setPresetError(presetErrorMessage("identity-unavailable"));
+      return;
+    }
+    if (selectedFolder !== null) {
+      if (!foldersLoaded) {
+        setPresetError("Wait for your folders to load before saving this preset.");
+        return;
+      }
+      if (!folders.some((folder) => folder.id === selectedFolder)) {
+        setPresetError("The selected folder is no longer available. Choose another folder.");
+        return;
+      }
+    }
+
+    const created = createFilterPreset(savedFilterPresets, presetName, {
+      folderId: selectedFolder,
+      fileType: selectedFileType,
+      sortBy,
+    });
+    if (created.error) {
+      setPresetError(presetErrorMessage(created.error));
+      return;
+    }
+
+    const saved = saveFilterPresets(user.id, created.presets);
+    if (!saved.ok) {
+      setPresetStorageAvailable(false);
+      setPresetError(presetErrorMessage(saved.error));
+      return;
+    }
+    setPresetStorageAvailable(true);
+    setSavedFilterPresets(saved.presets);
+    setSelectedPresetName(created.preset.name);
+    setPresetName("");
+    setPresetMessage(`Saved preset “${created.preset.name}”.`);
+  };
+
+  const handleApplyPreset = () => {
+    setPresetError("");
+    setPresetMessage("");
+    const preset = normalizeFilterPreset(
+      savedFilterPresets.find((item) => item.name === selectedPresetName),
+    );
+    if (!preset) {
+      setPresetError("Choose a valid saved preset first.");
+      return;
+    }
+    if (preset.folderId !== null) {
+      if (!foldersLoaded) {
+        setPresetError("Wait for your folders to load before applying this preset.");
+        return;
+      }
+      if (!folders.some((folder) => folder.id === preset.folderId)) {
+        setPresetError("This preset's folder is no longer available to your account. Delete it or choose another preset.");
+        return;
+      }
+    }
+
+    const clearedSearch = Boolean(searchQuery);
+    setSelectedFolder(preset.folderId);
+    setSelectedFileType(preset.fileType);
+    setSortBy(preset.sortBy);
+    if (clearedSearch) setSearchQuery("");
+    setPresetMessage(
+      clearedSearch
+        ? `Applied “${preset.name}”. Search was cleared so the saved filters are active.`
+        : `Applied preset “${preset.name}”.`,
+    );
+  };
+
+  const handleDeletePreset = () => {
+    setPresetError("");
+    setPresetMessage("");
+    if (!user?.id || !selectedPresetName) return;
+    const remaining = deleteFilterPreset(savedFilterPresets, selectedPresetName);
+    const saved = saveFilterPresets(user.id, remaining);
+    if (!saved.ok) {
+      setPresetStorageAvailable(false);
+      setPresetError(presetErrorMessage(saved.error));
+      return;
+    }
+    setPresetStorageAvailable(true);
+    setSavedFilterPresets(saved.presets);
+    setSelectedPresetName("");
+    setPresetMessage("Deleted the saved preset.");
+  };
+
   const handleUpload = async (e) => {
+    const generation = accountGeneration.current;
   e.preventDefault();
   setError("");
   setUploadSuccess("");
@@ -201,12 +399,14 @@ function App() {
 
   try {
     await uploadDocument(formData);
+    if (generation !== accountGeneration.current) return;
     setUploadFile(null);
     e.target.reset(); // clear input
     setUploadSuccess("Document uploaded successfully!");
     setTimeout(() => setUploadSuccess(""), 4000);
     fetchDocuments();
   } catch (err) {
+    if (generation !== accountGeneration.current) return;
     console.error(err);
     const message = err.response?.data?.detail || "Upload failed. Please check the file format and try again.";
     setError(message);
@@ -217,15 +417,18 @@ function App() {
     if (!window.confirm("Are you sure you want to delete this document?")) {
       return;
     }
+    const generation = accountGeneration.current;
     try {
       await deleteDocument(id);
+      if (generation !== accountGeneration.current) return;
       setSelectedDocIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
         return next;
       });
-      fetchDocuments();
+      fetchDocuments(generation);
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       console.error(err);
       setError("Failed to delete document");
     }
@@ -263,29 +466,34 @@ function App() {
 
   const handleBulkDelete = async () => {
     if (selectedDocIds.size === 0) return;
+    const generation = accountGeneration.current;
+    const requestedIds = Array.from(selectedDocIds);
     setIsBulkDeleting(true);
     setBulkMessage("");
     try {
-      const res = await bulkDeleteDocuments(Array.from(selectedDocIds));
+      const res = await bulkDeleteDocuments(requestedIds);
+      if (generation !== accountGeneration.current) return;
       const { total_deleted, failed } = res.data;
       if (failed && failed.length > 0) {
         setBulkMessage(`Deleted ${total_deleted} document(s). Failed to delete ${failed.length} document(s).`);
       } else {
         setBulkMessage(`Successfully deleted ${total_deleted} document(s).`);
       }
-      setSelectedDocIds(new Set());
+      setSelectedDocIds(new Set((failed || []).map(({ id }) => id)));
       setShowBulkDeleteConfirm(false);
-      fetchDocuments();
+      fetchDocuments(generation);
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       console.error(err);
       setError(err.response?.data?.detail || "Failed to perform bulk deletion");
     } finally {
-      setIsBulkDeleting(false);
+      if (generation === accountGeneration.current) setIsBulkDeleting(false);
     }
   };
 
   const handleCreateFolder = async (e) => {
     e.preventDefault();
+    const generation = accountGeneration.current;
     setCreateFolderError("");
     if (!newFolderName.trim()) {
       setCreateFolderError("Folder name cannot be empty or whitespace-only");
@@ -294,18 +502,21 @@ function App() {
     setCreatingFolder(true);
     try {
       await createFolder(newFolderName.trim());
+      if (generation !== accountGeneration.current) return;
       setNewFolderName("");
       fetchFolders();
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       console.error(err);
       setCreateFolderError(folderErrorMessage(err, "Failed to create folder"));
     } finally {
-      setCreatingFolder(false);
+      if (generation === accountGeneration.current) setCreatingFolder(false);
     }
   };
 
   const handleRenameFolder = async (e) => {
     e.preventDefault();
+    const generation = accountGeneration.current;
     setRenameFolderError("");
     if (!renameFolderName.trim()) {
       setRenameFolderError("Folder name cannot be empty or whitespace-only");
@@ -314,24 +525,29 @@ function App() {
     setRenamingFolder(true);
     try {
       const res = await renameFolder(editingFolderId, renameFolderName.trim());
+      if (generation !== accountGeneration.current) return;
       setFolders((current) =>
         current.map((folder) => folder.id === res.data.id ? res.data : folder)
       );
       setEditingFolderId(null);
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       setRenameFolderError(folderErrorMessage(err, "Failed to rename folder"));
     } finally {
-      setRenamingFolder(false);
+      if (generation === accountGeneration.current) setRenamingFolder(false);
     }
   };
 
   const handleDeleteFolder = async (id) => {
+    const generation = accountGeneration.current;
     try {
       await deleteFolder(id);
+      if (generation !== accountGeneration.current) return;
       if (selectedFolder === id) setSelectedFolder(null);
       fetchFolders();
       fetchDocuments();
     } catch (err) {
+      if (generation !== accountGeneration.current) return;
       console.error(err);
       setError("Failed to delete folder");
     }
@@ -687,6 +903,95 @@ function App() {
                   </select>
                 </div>
               </div>
+            </div>
+
+            <div className="px-4 py-3 border-b flex flex-wrap items-end gap-4">
+              <form onSubmit={handleSavePreset} className="flex flex-wrap items-end gap-2">
+                <div>
+                  <label htmlFor="filterPresetName" className="block text-xs font-medium text-gray-600 mb-1">
+                    Save current filters
+                  </label>
+                  <input
+                    id="filterPresetName"
+                    value={presetName}
+                    maxLength={MAX_FILTER_PRESET_NAME_LENGTH}
+                    disabled={!presetStorageAvailable || !user?.id}
+                    aria-describedby={presetError ? "filter-preset-error" : undefined}
+                    className="border border-gray-300 rounded-md px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-gray-100"
+                    placeholder="Preset name"
+                    onChange={(event) => {
+                      setPresetName(event.target.value);
+                      setPresetError("");
+                    }}
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={!presetStorageAvailable || !user?.id}
+                  className="px-3 py-1.5 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Save preset
+                </button>
+              </form>
+
+              <div className="flex flex-wrap items-end gap-2">
+                <div>
+                  <label htmlFor="savedFilterPreset" className="block text-xs font-medium text-gray-600 mb-1">
+                    Saved presets
+                  </label>
+                  <select
+                    id="savedFilterPreset"
+                    value={selectedPresetName}
+                    disabled={!presetsLoaded || savedFilterPresets.length === 0}
+                    className="border border-gray-300 rounded-md px-2.5 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-gray-100"
+                    onChange={(event) => {
+                      setSelectedPresetName(event.target.value);
+                      setPresetError("");
+                      setPresetMessage("");
+                    }}
+                  >
+                    <option value="">Choose a preset</option>
+                    {savedFilterPresets.map((preset) => (
+                      <option key={preset.name} value={preset.name}>{preset.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleApplyPreset}
+                  disabled={!selectedPresetName}
+                  className="px-3 py-1.5 text-sm font-medium text-indigo-700 border border-indigo-200 rounded-md hover:bg-indigo-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Apply preset
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeletePreset}
+                  disabled={!selectedPresetName || !presetStorageAvailable}
+                  className="px-3 py-1.5 text-sm font-medium text-gray-700 border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Delete preset
+                </button>
+              </div>
+
+              {presetsLoaded && savedFilterPresets.length === 0 && presetStorageAvailable && (
+                <p className="w-full text-sm text-gray-500">No saved presets yet. Save your current folder, type, and sort filters to reuse them.</p>
+              )}
+              {presetStorageAvailable === false && (
+                <p id="filter-preset-error" role="alert" className="w-full text-sm text-red-700">
+                  {presetError || "Saved presets are unavailable in this browser."}
+                </p>
+              )}
+              {presetStorageAvailable && presetError && (
+                <p id="filter-preset-error" role="alert" className="w-full text-sm text-red-700">
+                  {presetError}
+                </p>
+              )}
+              {presetMessage && (
+                <p role="status" aria-live="polite" className="w-full text-sm text-green-700">
+                  {presetMessage}
+                </p>
+              )}
             </div>
 
             {bulkMessage && (
