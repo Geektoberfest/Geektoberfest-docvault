@@ -41,6 +41,7 @@ export const downloadDocument = (id, signal) => api.get(`/documents/${id}/downlo
   responseType: 'blob',
   signal,
 });
+export const bulkDeleteDocuments = (documentIds) => api.post('/documents/bulk-delete', { document_ids: documentIds });
 export const searchDocuments = (q) => api.get(`/documents/search?q=${q}`);
 
 // Folder endpoints
