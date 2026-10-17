@@ -19,6 +19,10 @@ UPLOAD_DIR = "uploads"
 
 MAX_FILE_SIZE = 10 * 1024 * 1024 # 10 MB
 
+def _lock_storage_owner(db: Session, owner_id: int) -> None:
+    # Uploads and deletes take this lock before touching document accounting.
+    db.query(models.User.id).filter(models.User.id == owner_id).with_for_update().one()
+
 @router.post("/upload", response_model=schemas.DocumentResponse)
 def upload_document(
     request: Request,
@@ -48,7 +52,7 @@ def upload_document(
         # Locking the user's row serializes uploads for this owner. Under
         # PostgreSQL READ COMMITTED, the following SUM sees the prior upload's
         # commit after this lock becomes available.
-        db.query(models.User.id).filter(models.User.id == current_user.id).with_for_update().one()
+        _lock_storage_owner(db, current_user.id)
         used_bytes = db.query(func.coalesce(func.sum(models.Document.file_size), 0)).filter(
             models.Document.owner_id == current_user.id,
             models.Document.file_size >= 0,
@@ -186,8 +190,67 @@ def download_document(request: Request, doc_id: int, db: Session = Depends(get_d
         media_type=doc.content_type
     )
 
+@router.post("/bulk-delete", response_model=schemas.BulkDeleteResponse)
+def bulk_delete_documents(
+    request: Request,
+    payload: schemas.BulkDeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    deleted_ids = []
+    failed = []
+    _lock_storage_owner(db, current_user.id)
+    seen_doc_ids = set()
+
+    for doc_id in payload.document_ids:
+        if doc_id in seen_doc_ids:
+            failed.append(schemas.BulkDeleteFailure(id=doc_id, reason="Duplicate document ID"))
+            continue
+        seen_doc_ids.add(doc_id)
+        doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        if not doc:
+            failed.append(schemas.BulkDeleteFailure(id=doc_id, reason="Document not found"))
+            continue
+
+        if doc.owner_id != current_user.id:
+            failed.append(schemas.BulkDeleteFailure(id=doc_id, reason="Access denied"))
+            continue
+
+        doc_name = doc.original_filename
+        try:
+            os.remove(doc.file_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            failed.append(schemas.BulkDeleteFailure(id=doc_id, reason="File could not be deleted"))
+            continue
+
+        db.delete(doc)
+        db.flush()
+
+        log_event(
+            db,
+            user_id=current_user.id,
+            action="bulk_delete",
+            target_type="document",
+            target_id=doc_id,
+            target_name=doc_name,
+            ip_address=request.client.host if request.client else None,
+        )
+        deleted_ids.append(doc_id)
+
+    db.commit()
+
+    return schemas.BulkDeleteResponse(
+        deleted_ids=deleted_ids,
+        failed=failed,
+        total_requested=len(payload.document_ids),
+        total_deleted=len(deleted_ids),
+    )
+
 @router.delete("/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_document(request: Request, doc_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    _lock_storage_owner(db, current_user.id)
     doc = get_owned_document(db, doc_id, current_user)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -195,9 +258,14 @@ def delete_document(request: Request, doc_id: int, db: Session = Depends(get_db)
     # Capture name before deletion so the audit record is meaningful
     doc_name = doc.original_filename
 
-    # Remove file from disk
-    if os.path.exists(doc.file_path):
+    # Keep the row (and its quota usage) when the stored file cannot be removed.
+    try:
         os.remove(doc.file_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Document file could not be deleted") from None
 
     db.delete(doc)
     db.flush()

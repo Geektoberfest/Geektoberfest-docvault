@@ -39,6 +39,7 @@ export const uploadDocument = (formData, { signal, onUploadProgress } = {}) => a
   onUploadProgress,
 });
 export const deleteDocument = (id) => api.delete(`/documents/${id}`);
+export const bulkDeleteDocuments = (documentIds) => api.post('/documents/bulk-delete', { document_ids: documentIds });
 export const searchDocuments = (q) => api.get(`/documents/search?q=${q}`);
 
 // Folder endpoints

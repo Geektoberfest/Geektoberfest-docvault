@@ -1,6 +1,7 @@
 import io
 import os
 import tempfile
+import threading
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -205,6 +206,50 @@ class StorageQuotaTests(unittest.TestCase):
         self.assertEqual(len(self.stored_documents()), 1)
         self.assertEqual(self.upload(b"x").status_code, 413)
 
+    def test_failed_bulk_file_removal_does_not_reclaim_quota(self):
+        self.assertEqual(self.upload(b"12345").status_code, 200)
+        doc = self.stored_documents()[0]
+        with mock.patch.object(documents.os, "remove", side_effect=PermissionError("private path detail")):
+            response = self.client.post(
+                "/documents/bulk-delete",
+                headers=self.headers(),
+                json={"document_ids": [doc.id]},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total_deleted"], 0)
+        self.assertEqual(response.json()["failed"], [{"id": doc.id, "reason": "File could not be deleted"}])
+        self.assertTrue(os.path.exists(doc.file_path))
+        self.assertEqual(sum(row.file_size for row in self.stored_documents()), 5)
+        self.assertEqual(self.upload(b"x").status_code, 413)
+
+    def test_mixed_bulk_cleanup_reclaims_only_removed_file_usage(self):
+        self.assertEqual(self.upload(b"12").status_code, 200)
+        self.assertEqual(self.upload(b"345").status_code, 200)
+        failed_doc, deleted_doc = sorted(self.stored_documents(), key=lambda doc: doc.id)
+        remove_file = os.remove
+
+        def fail_one_file(path):
+            if path == failed_doc.file_path:
+                raise PermissionError("private path detail")
+            remove_file(path)
+
+        with mock.patch.object(documents.os, "remove", side_effect=fail_one_file):
+            response = self.client.post(
+                "/documents/bulk-delete",
+                headers=self.headers(),
+                json={"document_ids": [failed_doc.id, deleted_doc.id]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total_deleted"], 1)
+        self.assertEqual(response.json()["deleted_ids"], [deleted_doc.id])
+        self.assertEqual(response.json()["failed"], [{"id": failed_doc.id, "reason": "File could not be deleted"}])
+        self.assertTrue(os.path.exists(failed_doc.file_path))
+        self.assertFalse(os.path.exists(deleted_doc.file_path))
+        self.assertEqual(sum(row.file_size for row in self.stored_documents()), 2)
+        self.assertEqual(self.upload(b"678").status_code, 200)
+        self.assertEqual(self.upload(b"x").status_code, 413)
+
 
 @unittest.skipUnless(os.getenv("DOCVAULT_TEST_POSTGRES_URL"), "set DOCVAULT_TEST_POSTGRES_URL to an isolated PostgreSQL test database")
 class PostgreSQLQuotaConcurrencyTests(unittest.TestCase):
@@ -272,6 +317,51 @@ class PostgreSQLQuotaConcurrencyTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             statuses = list(pool.map(self.concurrent_upload, ("alice", "bob")))
         self.assertEqual(statuses, [200, 200])
+
+    def test_same_user_upload_waits_for_bulk_delete_quota_commit(self):
+        headers = {"Authorization": f"Bearer {auth.create_access_token({'sub': 'alice'})}"}
+        with TestClient(self.app) as client:
+            uploaded = client.post(
+                "/documents/upload", headers=headers,
+                files={"file": ("full.txt", io.BytesIO(b"12345"), "text/plain")},
+            )
+        self.assertEqual(uploaded.status_code, 200)
+        doc_id = uploaded.json()["id"]
+        deleting_file = threading.Event()
+        resume_delete = threading.Event()
+        remove_file = os.remove
+
+        def pause_after_unlink(path):
+            remove_file(path)
+            deleting_file.set()
+            if not resume_delete.wait(timeout=5):
+                raise TimeoutError("test did not release the paused deletion")
+
+        def delete_document():
+            with TestClient(self.app) as client:
+                return client.post(
+                    "/documents/bulk-delete", headers=headers,
+                    json={"document_ids": [doc_id]},
+                )
+
+        try:
+            with mock.patch.object(documents.os, "remove", side_effect=pause_after_unlink):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    deletion = pool.submit(delete_document)
+                    self.assertTrue(deleting_file.wait(timeout=5), "delete did not reach file cleanup")
+                    upload = pool.submit(self.concurrent_upload, "alice", b"12345")
+                    resume_delete.set()
+                    delete_response = deletion.result(timeout=5)
+                    upload_status = upload.result(timeout=5)
+        finally:
+            resume_delete.set()
+
+        self.assertEqual(delete_response.status_code, 200, delete_response.text)
+        self.assertEqual(delete_response.json()["total_deleted"], 1)
+        self.assertEqual(upload_status, 200)
+        with self.factory() as db:
+            usage = db.query(models.Document.file_size).filter_by(owner_id=self.users["alice"].id).all()
+        self.assertEqual([row[0] for row in usage], [5])
 
 
 if __name__ == "__main__":
