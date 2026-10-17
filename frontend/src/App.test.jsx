@@ -10,7 +10,7 @@ vi.mock("./api", () => ({
   default: { get: vi.fn(), defaults: { baseURL: "https://api.test" } },
   getMe: vi.fn(), getFolders: vi.fn(),
   createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
-  uploadDocument: vi.fn(), deleteDocument: vi.fn(), searchDocuments: vi.fn(),
+  uploadDocument: vi.fn(), deleteDocument: vi.fn(), bulkDeleteDocuments: vi.fn(), searchDocuments: vi.fn(),
   login: vi.fn(), register: vi.fn(),
 }));
 
@@ -277,6 +277,40 @@ describe("saved filter presets", () => {
     await reloadedUser.click(screen.getByRole("button", { name: "Delete preset" }));
     expect(await screen.findByText(/No saved presets yet/)).toBeTruthy();
     expect(JSON.parse(localStorage.getItem("docvault:filter-presets:v1:1")).presets).toEqual([]);
+  });
+
+  it("keeps the active preset after bulk deletion and retains only failed selections", async () => {
+    const deleted = makeDocument(40, "deleted-report.pdf", 1, "application/pdf");
+    const retained = makeDocument(41, "failed-report.pdf", 1, "application/pdf");
+    const otherFolder = makeDocument(42, "other-report.pdf", 2, "application/pdf");
+    let deletionCompleted = false;
+    api.default.get.mockImplementation(() => ({
+      data: deletionCompleted ? [retained, otherFolder] : [deleted, retained, otherFolder],
+    }));
+    api.bulkDeleteDocuments.mockImplementation(async (_ids) => {
+      deletionCompleted = true;
+      return { data: { total_deleted: 1, deleted_ids: [deleted.id], failed: [{ id: retained.id, reason: "Access denied" }] } };
+    });
+    saveFilterPresets(1, [{ name: "Reports", folderId: 1, fileType: "pdf", sortBy: "date_desc" }]);
+
+    const user = await openApp();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Saved presets" }), "Reports");
+    await user.click(screen.getByRole("button", { name: "Apply preset" }));
+    expect(await screen.findByText(deleted.original_filename)).toBeTruthy();
+    expect(screen.getByText(retained.original_filename)).toBeTruthy();
+    expect(screen.queryByText(otherFolder.original_filename)).toBeNull();
+
+    await user.click(screen.getByRole("checkbox", { name: "Select all visible documents" }));
+    await user.click(screen.getByRole("button", { name: "Delete Selected" }));
+    await user.click(screen.getByRole("button", { name: "Delete Permanently" }));
+
+    expect(await screen.findByText("Deleted 1 document(s). Failed to delete 1 document(s).")).toBeTruthy();
+    await waitFor(() => expect(api.bulkDeleteDocuments).toHaveBeenCalledWith([deleted.id, retained.id]));
+    expect(screen.queryByText(deleted.original_filename)).toBeNull();
+    expect(screen.getByText(retained.original_filename)).toBeTruthy();
+    expect(screen.queryByText(otherFolder.original_filename)).toBeNull();
+    expect(screen.getByRole("combobox", { name: "Saved presets" }).value).toBe("Reports");
+    expect(screen.getByRole("checkbox", { name: `Select document ${retained.original_filename}` }).checked).toBe(true);
   });
 
   it("clears search visibly before applying saved filters", async () => {
